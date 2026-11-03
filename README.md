@@ -307,4 +307,3 @@ each trading day. The pipeline then resamples whole trading days with replacemen
 IC. `significant_positive_95` is true only when that lower confidence bound exceeds
 zero; this preserves intraday dependence rather than treating overlapping minutes
 as independent observations.
-

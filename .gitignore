@@ -1,0 +1,34 @@
+# Credentials and local editor state
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# Vendor market data and generated research artifacts
+minute_data/
+raw_data/
+processed_data/
+artifacts/
+*.parquet
+*.pth
+*.pt
+*.npz
+*.pkl
+*.pickle
+code_bundle.txt
+# Local, obsolete LOBSTER prototypes; not part of the minute-OHLCV pipeline.
+eval_script.py
+signature.py
+
+# Python and logs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# Operating-system files
+.DS_Store
+Thumbs.db
