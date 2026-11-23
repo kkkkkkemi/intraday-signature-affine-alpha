@@ -92,17 +92,37 @@ class MassiveClient:
         self._last_request_at = 0.0
         self.session = requests.Session()
 
-    def _get(self, url: str, params: dict | None = None) -> dict:
-        elapsed = time.monotonic() - self._last_request_at
-        if elapsed < self.min_interval_seconds:
-            time.sleep(self.min_interval_seconds - elapsed)
+    def _get(self, url: str, params: dict | None = None, max_attempts: int = 6) -> dict:
+        """GET with pacing, plus retry on 429, 5xx and network errors (exponential backoff)."""
         request_params = {"apiKey": self.api_key}
         if params:
             request_params.update(params)
-        response = self.session.get(url, params=request_params, timeout=60)
-        self._last_request_at = time.monotonic()
-        if response.status_code == 429:
-            raise MassiveDownloadError("Massive rate limit reached. Wait a minute and rerun; completed files are retained.")
+        for attempt in range(1, max_attempts + 1):
+            elapsed = time.monotonic() - self._last_request_at
+            if elapsed < self.min_interval_seconds:
+                time.sleep(self.min_interval_seconds - elapsed)
+            try:
+                response = self.session.get(url, params=request_params, timeout=60)
+            except requests.RequestException as exc:
+                self._last_request_at = time.monotonic()
+                if attempt == max_attempts:
+                    raise MassiveDownloadError(f"Network error after {attempt} attempts: {exc}") from exc
+                wait = min(15.0 * 2 ** (attempt - 1), 300.0)
+                print(f"    network error ({exc.__class__.__name__}); retrying in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            self._last_request_at = time.monotonic()
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt == max_attempts:
+                    raise MassiveDownloadError(
+                        f"Massive returned {response.status_code} after {attempt} attempts; rerun later, "
+                        "completed files are retained."
+                    )
+                wait = 65.0 if response.status_code == 429 else min(15.0 * 2 ** (attempt - 1), 300.0)
+                print(f"    HTTP {response.status_code}; retrying in {wait:.0f}s (attempt {attempt}/{max_attempts})")
+                time.sleep(wait)
+                continue
+            break
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -135,6 +155,13 @@ def download_tickers(
     output_dir.mkdir(parents=True, exist_ok=True)
     load_local_env()
     client = MassiveClient(api_key or os.environ.get("MASSIVE_API_KEY", ""))
+    manifest_path = output_dir / "manifest.json"
+    previous_files: dict[str, object] = {}
+    if manifest_path.exists():
+        try:
+            previous_files = dict(json.loads(manifest_path.read_text(encoding="utf-8")).get("files", {}))
+        except (json.JSONDecodeError, OSError):
+            previous_files = {}
     manifest: dict[str, object] = {
         "source": "Massive Stocks minute aggregates",
         "endpoint": "v2/aggs/ticker/{ticker}/range/1/minute/{from}/{to}",
@@ -143,8 +170,10 @@ def download_tickers(
         "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
         "requested_start": start.isoformat(),
         "requested_end": end.isoformat(),
-        "files": {},
+        "files": previous_files,
     }
+    failed: list[str] = []
+    empty: list[str] = []
 
     for ticker in sorted({item.upper() for item in tickers}):
         destination = output_dir / f"{ticker}.parquet"
@@ -152,9 +181,15 @@ def download_tickers(
             print(f"Skipping {ticker}: {destination.name} already exists (use --overwrite to refresh).")
             continue
         print(f"Downloading {ticker}: {start} to {end} …")
-        frame = client.minute_aggregates(ticker, start, end)
+        try:
+            frame = client.minute_aggregates(ticker, start, end)
+        except MassiveDownloadError as exc:
+            print(f"  FAILED {ticker}: {exc}")
+            failed.append(ticker)
+            continue
         if frame.empty:
             print(f"  No regular-session minute aggregates returned for {ticker}.")
+            empty.append(ticker)
             continue
         frame.to_parquet(destination, index=False)
         manifest["files"][ticker] = {
@@ -164,8 +199,12 @@ def download_tickers(
             "last_timestamp": frame["timestamp"].max().isoformat(),
         }
         print(f"  Saved {len(frame):,} bars to {destination}")
+        # Persist after every ticker so an interrupted run keeps an accurate manifest.
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if failed or empty:
+        print(f"\nNot downloaded - failed: {failed or 'none'}; empty: {empty or 'none'}. Rerun to retry failures.")
 
 
 def parse_args() -> argparse.Namespace:

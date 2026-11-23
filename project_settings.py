@@ -6,19 +6,28 @@ PowerShell arguments or PowerShell environment variables.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
 
 
-TICKERS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO",
-    "AMD", "INTC", "ORCL", "CRM", "NFLX", "TSLA",
-    "JPM", "BAC", "GS", "MS", "V", "MA",
-    "WMT", "COST", "HD", "JNJ", "UNH", "XOM",
-]
-DATA_DIR = "minute_data"
-OUTPUT_DIR = "artifacts/signature_affine_n25_sig91_state7_ms3_clv_sector_shrink5_target_sector_mean_normalscore_ens42_43_44_z0anchor5scale_pp_pca12_pv_pca16_continuous_z1_gate1bp_m0_w30_h30_tr5_ev30"
-START_DATE = (date.today() - timedelta(days=720)).isoformat()
-END_DATE = date.today().isoformat()
+from universe import universe
+
+# Research universe:
+#   "sp100"  - S&P 100 as of the sample start (100 names; see universe.py)
+#   "mega25" - the original 25 mega caps (results under the old artifact folders)
+UNIVERSE = "sp100"
+TICKERS = list(universe(UNIVERSE))
+# Each universe has its own data folder so files always share one download window.
+DATA_DIR = {"sp100": "minute_data_sp100", "mega25": "minute_data"}[UNIVERSE]
+# Earlier 25-name runs (kept for reference):
+#   artifacts/linsde_r4_nll0p1_n25_sig91_state7_ens42_43_44_pp_pca12_pv_pca16_w30_h30_tr5_ev30   (Gaussian)
+#   artifacts/linsde_r4_merton_nll0p1_clip20_n25_sig91_state7_ens42_43_44_pp_pca12_pv_pca16_w30_h30_tr5_ev30 (Merton)
+OUTPUT_DIR = f"artifacts/{UNIVERSE}_linsde_r4_merton_nll0p1_clip20_ens42_43_44_pp_pca12_pv_pca16_w30_h30_tr5_ev5"
+# Massive Basic serves roughly the most recent two years of minute aggregates.
+# The window is pinned (it is the one used for the 2026-11-23 sp100 download) so
+# that re-running download_data.py to retry failed tickers fetches the same dates.
+# The final, still-open session of 2026-11-23 is removed automatically by
+# minute_alpha.drop_incomplete_sessions.  For a fresh download, move both dates.
+START_DATE = "2024-12-03"
+END_DATE = "2026-11-23"
 
 # Model and evaluation settings. Missing minute aggregates are represented in the
 # feature path; targets still require real entry and exit bars.
@@ -31,7 +40,8 @@ BATCH_SIZE = 16
 MAX_EPOCHS = 60
 PATIENCE = 10
 WARMUP_EPOCHS = 3
-MIN_LABELLED_SYMBOLS = 15
+# Minimum labelled names per cross-section (~60% of the universe).
+MIN_LABELLED_SYMBOLS = {"sp100": 60, "mega25": 15}[UNIVERSE]
 # The contemporaneous sector median is shrunk toward the universe median using
 # lambda = n_real_sector_bars / (n_real_sector_bars + this value).
 SECTOR_MEDIAN_SHRINKAGE_COUNT = 5.0
@@ -66,10 +76,14 @@ PROFITABILITY_GATE_COST_BPS = 0.6
 PROFITABILITY_GATE_MIN_PROBABILITY = 0.45
 PROFITABILITY_GATE_L2 = 1.0
 # Training samples use overlapping 30-minute feature/label windows at five-minute
-# offsets. Validation and final OOS retain strictly non-overlapping 30-minute
-# sleeves.
+# offsets.  Validation and OOS are now scored at the same 5-minute stride, so
+# checkpoint selection and reported Rank IC use every 5-minute cross-section
+# (~6x more than the old 30-minute stride, which over-rewarded noise at the 12
+# fixed daily times).  Overlapping labels are handled by averaging IC within each
+# day before the day-block bootstrap.  Portfolio evaluation still trades only on
+# the non-overlapping 30-minute rebalance grid, so backtests are unchanged.
 TRAIN_SAMPLE_STRIDE_MINUTES = 5
-EVALUATION_SAMPLE_STRIDE_MINUTES = 30
+EVALUATION_SAMPLE_STRIDE_MINUTES = 5
 BOOTSTRAP_ITERATIONS = 10_000
 SEED = 42
 ENSEMBLE_SEEDS = (42, 43, 44)
@@ -81,3 +95,34 @@ GPU_PIN_MEMORY = True
 GPU_ALLOW_TF32 = True
 GPU_AMP_ENABLED = False
 DETERMINISTIC = True
+
+# Linear latent SDE layer: dZ = (A(c)Z + b(c))dt + G(c)dW with G(c) of rank
+# SDE_DIFFUSION_RANK.  The predictive mean and variance of the 30-minute
+# sector-excess return are computed exactly (matrix exponential + Van Loan), so
+# no Monte Carlo is used.  0 = deterministic affine-mean model (ablation).
+SDE_DIFFUSION_RANK = 4
+SDE_DIFFUSION_FLOOR = 1e-4
+# Total loss = rank loss + SDE_NLL_WEIGHT * Gaussian NLL.  Rank IC still selects
+# checkpoints, so ablation runs use the same selection rule.
+SDE_NLL_WEIGHT = 0.1
+# Standardised targets are clipped at +/- this many robust-scale units in the NLL.
+# Jump models need the tails, so use a wide clip.  Compare NLL only between runs
+# that use the same clip (re-run the Gaussian model with 20 for a like-for-like test).
+SDE_TARGET_CLIP = 20.0
+# Ungated one-way cost grid used to compare rank-score vs uncertainty-scaled sizing.
+SDE_COST_CURVE_BPS = (0.0, 0.3, 0.6, 1.0, 1.5, 2.0)
+# Heavy-tailed component over the 30-minute holding period:
+#   "none"      Gaussian (diffusion + observation noise)
+#   "merton"    + compound-Poisson jumps, N ~ Poisson(lambda(c)), xi ~ N(0, s_J(c)^2);
+#               exact Poisson-mixture likelihood truncated at SDE_JUMP_MAX_COUNT
+#   "student_t" Student-t with a global learned dof (low-cost control)
+SDE_JUMP_MODE = "merton"
+SDE_JUMP_MAX_COUNT = 8
+# Initial jump intensity per 30-minute period and jump std (standardised units).
+SDE_JUMP_INITIAL_INTENSITY = 0.05
+SDE_JUMP_INITIAL_STD = 2.0
+
+# Tuning discipline: while False, train_model.py never scores the test split and
+# skips the gate / OOS evaluation.  Set True only for the final frozen run.
+# (tune_sde.py always runs validation-only.)
+EVALUATE_TEST = False

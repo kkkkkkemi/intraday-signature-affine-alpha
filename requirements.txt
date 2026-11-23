@@ -4,6 +4,6 @@ pyarrow>=15.0
 requests>=2.31
 scipy>=1.12
 torch>=2.2
-# Optional for the retained legacy Neural-SDE experiments; the default affine model does not use it.
-torchsde>=0.2.6
 signatory>=1.2.6
+# Baseline only (train_xgboost.py)
+xgboost>=2.0

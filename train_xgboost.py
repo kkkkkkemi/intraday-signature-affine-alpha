@@ -53,6 +53,7 @@ from project_settings import (
     BOOTSTRAP_ITERATIONS,
     DATA_DIR,
     ENSEMBLE_SEEDS,
+    EVALUATE_TEST,
     EVALUATION_SAMPLE_STRIDE_MINUTES,
     HOLDING_MINUTES,
     MIN_LABELLED_SYMBOLS,
@@ -70,6 +71,7 @@ from project_settings import (
     TICKERS,
     TRAIN_RATIO,
     TRAIN_SAMPLE_STRIDE_MINUTES,
+    UNIVERSE,
     VALIDATION_RATIO,
     WINDOW_MINUTES,
     Z_SCORE_THRESHOLD,
@@ -79,7 +81,9 @@ from project_settings import (
 # These settings affect only the new baseline. Adjust them here without changing
 # project_settings.py or the signature-affine model.
 PROJECT_DIR = Path(__file__).resolve().parent
-XGB_OUTPUT_DIR = Path(OUTPUT_DIR).parent / "xgboost_comparison"
+# One folder per universe and evaluation stride, so earlier results are never
+# overwritten (the original 25-name run lives in artifacts/xgboost_comparison).
+XGB_OUTPUT_DIR = Path(OUTPUT_DIR).parent / f"xgboost_{UNIVERSE}_ev{EVALUATION_SAMPLE_STRIDE_MINUTES}"
 XGB_BOOSTING_ROUNDS = 400
 XGB_CHECKPOINT_EVERY = 25
 XGB_MAX_DEPTH = 3
@@ -205,11 +209,11 @@ def _fit_one_seed(
     seed: int,
     train_matrix: xgb.DMatrix,
     validation_matrix: xgb.DMatrix,
-    test_matrix: xgb.DMatrix,
+    test_matrix: xgb.DMatrix | None,
     validation_metadata: pd.DataFrame,
-    test_metadata: pd.DataFrame,
+    test_metadata: pd.DataFrame | None,
     output_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object], dict[str, float]]:
+) -> tuple[pd.DataFrame, pd.DataFrame | None, dict[str, object], dict[str, float]]:
     params = {
         "objective": "rank:pairwise",
         "eval_metric": "ndcg",
@@ -243,10 +247,13 @@ def _fit_one_seed(
     validation = _prediction_frame(
         validation_metadata, booster.predict(validation_matrix, iteration_range=(0, best_round))
     )
-    test = _prediction_frame(test_metadata, booster.predict(test_matrix, iteration_range=(0, best_round)))
+    test = None
+    if test_matrix is not None and test_metadata is not None:
+        test = _prediction_frame(test_metadata, booster.predict(test_matrix, iteration_range=(0, best_round)))
     booster.save_model(output_dir / f"xgboost_seed_{seed}.json")
     validation.to_parquet(output_dir / f"seed_{seed}_validation_predictions.parquet", index=False)
-    test.to_parquet(output_dir / f"seed_{seed}_oos_predictions.parquet", index=False)
+    if test is not None:
+        test.to_parquet(output_dir / f"seed_{seed}_oos_predictions.parquet", index=False)
     summary = {"seed": seed, "best_trees": best_round, "best_validation_mean_daily_rank_ic": best_ic, "checkpoints": history}
     (output_dir / f"seed_{seed}_training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return validation, test, summary, booster.get_score(importance_type="gain")
@@ -275,6 +282,32 @@ def _paired_daily_ic_comparison(xgb_frame: pd.DataFrame, neural_frame: pd.DataFr
         "neural_mean_daily_rank_ic": float(neural_daily.loc[common_days].mean()),
         "xgboost_minus_neural_daily_rank_ic": bootstrap,
     }
+
+
+def _validation_only_comparison(
+    val_prediction: pd.DataFrame, val_ic: dict[str, object], neural_dir: Path, output_dir: Path
+) -> None:
+    """Paired validation comparison with the neural run in OUTPUT_DIR; the test split is never read."""
+    comparison: dict[str, object] = {"split": "validation", "xgboost_validation_rank_ic": val_ic}
+    neural_path = neural_dir / "ensemble_validation_predictions.parquet"
+    if neural_path.exists():
+        neural_val = pd.read_parquet(neural_path)
+        if _same_labels(val_prediction, neural_val):
+            comparison["neural_validation_rank_ic"] = block_bootstrap_mean_ic(
+                _daily_rank_ic_from_prediction_frame(neural_val), BOOTSTRAP_ITERATIONS, SEED
+            )
+            comparison["paired_validation_rank_ic"] = _paired_daily_ic_comparison(val_prediction, neural_val)
+            print("Paired validation comparison with the neural run saved.")
+        else:
+            comparison["neural_comparison_status"] = (
+                "Neural validation predictions use different signal keys or labels; rerun both on the same settings."
+            )
+            print(comparison["neural_comparison_status"])
+    else:
+        comparison["neural_comparison_status"] = f"No neural validation predictions in {neural_dir}."
+    (output_dir / "comparison_validation.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+    print(f"XGBoost validation mean daily Rank IC: {val_ic['mean_daily_rank_ic']:.5f} (test split not scored)")
+    print(f"Results saved to {output_dir}")
 
 
 def main() -> None:
@@ -319,24 +352,39 @@ def main() -> None:
         "profitability_gate_l2": PROFITABILITY_GATE_L2,
         "rank_target": "within-sector forward excess return ordered within each timestamp",
         "training_objective": "grouped rank:pairwise; validation checkpoint selected by mean daily sector-neutral Rank IC",
+        "universe": UNIVERSE,
+        "evaluate_test": EVALUATE_TEST,
     }
     (output_dir / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     bars = load_minute_bars(data_dir, TICKERS)
     features = engineer_minute_features(bars, HOLDING_MINUTES, SECTOR_MEDIAN_SHRINKAGE_COUNT)
+    del bars
     train_raw, validation_raw, test_raw = split_by_session(features, TRAIN_RATIO, VALIDATION_RATIO)
+    del features
     scaler = fit_feature_scaler(train_raw)
     (output_dir / "feature_scaler.json").write_text(json.dumps(scaler, indent=2), encoding="utf-8")
-    train, validation, test = (
-        apply_feature_scaler(frame, scaler) for frame in (train_raw, validation_raw, test_raw)
+    train_set = CrossSectionalMinuteDataset(
+        apply_feature_scaler(train_raw, scaler), WINDOW_MINUTES, MIN_LABELLED_SYMBOLS, TRAIN_SAMPLE_STRIDE_MINUTES
     )
-    train_set = CrossSectionalMinuteDataset(train, WINDOW_MINUTES, MIN_LABELLED_SYMBOLS, TRAIN_SAMPLE_STRIDE_MINUTES)
-    validation_set = CrossSectionalMinuteDataset(validation, WINDOW_MINUTES, MIN_LABELLED_SYMBOLS, EVALUATION_SAMPLE_STRIDE_MINUTES)
-    test_set = CrossSectionalMinuteDataset(test, WINDOW_MINUTES, MIN_LABELLED_SYMBOLS, EVALUATION_SAMPLE_STRIDE_MINUTES)
-    if not train_set.symbols == validation_set.symbols == test_set.symbols:
+    del train_raw
+    validation_set = CrossSectionalMinuteDataset(
+        apply_feature_scaler(validation_raw, scaler), WINDOW_MINUTES, MIN_LABELLED_SYMBOLS, EVALUATION_SAMPLE_STRIDE_MINUTES
+    )
+    del validation_raw
+    test_set = (
+        CrossSectionalMinuteDataset(
+            apply_feature_scaler(test_raw, scaler), WINDOW_MINUTES, MIN_LABELLED_SYMBOLS, EVALUATION_SAMPLE_STRIDE_MINUTES
+        )
+        if EVALUATE_TEST
+        else None
+    )
+    del test_raw
+    if train_set.symbols != validation_set.symbols or (test_set is not None and train_set.symbols != test_set.symbols):
         raise ValueError("Train, validation, and test have different ticker universes.")
     print(
         f"XGBoost dataset: {len(train_set):,} train / {len(validation_set):,} validation / "
-        f"{len(test_set):,} OOS windows; {len(train_set.symbols)} symbols."
+        f"{(len(test_set) if test_set is not None else 0):,} OOS windows (scored={test_set is not None}); "
+        f"{len(train_set.symbols)} symbols."
     )
     pca = fit_cross_ticker_area_pca(train_set, PRICE_PRICE_AREA_PCA_COMPONENTS, PRICE_VOLUME_AREA_PCA_COMPONENTS)
     np.savez(
@@ -362,13 +410,15 @@ def main() -> None:
     print(f"Extracting {len(names)} fixed signature/context features on {device}...")
     train_x, train_meta = _matrix_and_metadata(train_set, representation, device, names)
     val_x, val_meta = _matrix_and_metadata(validation_set, representation, device, names)
-    test_x, test_meta = _matrix_and_metadata(test_set, representation, device, names)
+    test_x, test_meta = (
+        _matrix_and_metadata(test_set, representation, device, names) if test_set is not None else (None, None)
+    )
     del representation
     if device.type == "cuda":
         torch.cuda.empty_cache()
     train_dm = _dmatrix(train_x, train_meta, names, with_labels=True)
     val_dm = _dmatrix(val_x, val_meta, names, with_labels=False)
-    test_dm = _dmatrix(test_x, test_meta, names, with_labels=False)
+    test_dm = _dmatrix(test_x, test_meta, names, with_labels=False) if test_x is not None else None
     seeds = tuple(dict.fromkeys(ENSEMBLE_SEEDS))
     if not seeds:
         raise ValueError("ENSEMBLE_SEEDS must contain at least one seed.")
@@ -377,14 +427,21 @@ def main() -> None:
         for seed in seeds
     ]
     val_prediction = average_seed_prediction_frames([result[0] for result in fitted], seeds)
-    test_prediction = average_seed_prediction_frames([result[1] for result in fitted], seeds)
     val_prediction.to_parquet(output_dir / "ensemble_validation_predictions.parquet", index=False)
-    test_prediction.to_parquet(output_dir / "oos_predictions.parquet", index=False)
     importance = pd.DataFrame(
         {"feature": names, "mean_gain": [np.mean([result[3].get(name, 0.0) for result in fitted]) for name in names]}
     ).sort_values("mean_gain", ascending=False)
     importance.to_csv(output_dir / "feature_importance_gain.csv", index=False)
     val_ic = block_bootstrap_mean_ic(_daily_rank_ic_from_prediction_frame(val_prediction), BOOTSTRAP_ITERATIONS, SEED)
+    (output_dir / "validation_rank_ic_block_bootstrap.json").write_text(json.dumps(val_ic, indent=2), encoding="utf-8")
+    _daily_rank_ic_from_prediction_frame(val_prediction).rename_axis("session").reset_index().to_csv(
+        output_dir / "validation_daily_rank_ic.csv", index=False
+    )
+    if not EVALUATE_TEST:
+        _validation_only_comparison(val_prediction, val_ic, neural_dir, output_dir)
+        return
+    test_prediction = average_seed_prediction_frames([result[1] for result in fitted], seeds)
+    test_prediction.to_parquet(output_dir / "oos_predictions.parquet", index=False)
     oos_ic = block_bootstrap_mean_ic(_daily_rank_ic_from_prediction_frame(test_prediction), BOOTSTRAP_ITERATIONS, SEED + 1)
     costs = tuple(sorted({0.0, float(PROFITABILITY_GATE_COST_BPS)}))
     execution_options = {
@@ -418,7 +475,6 @@ def main() -> None:
     gated_metrics["profitability_gates"] = gate_diagnostics
     gated_returns.to_parquet(output_dir / "oos_holding_period_returns.parquet", index=False)
     (output_dir / "oos_metrics.json").write_text(json.dumps(gated_metrics, indent=2), encoding="utf-8")
-    (output_dir / "validation_rank_ic_block_bootstrap.json").write_text(json.dumps(val_ic, indent=2), encoding="utf-8")
     _daily_rank_ic_from_prediction_frame(test_prediction).rename_axis("session").reset_index().to_csv(
         output_dir / "oos_daily_rank_ic.csv", index=False
     )
