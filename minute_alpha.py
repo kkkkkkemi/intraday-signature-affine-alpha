@@ -1,7 +1,4 @@
-"""Train a signature-conditioned latent linear-SDE model on minute OHLCV bars.
-
-With ``sde_diffusion_rank=0`` the model reduces to the original deterministic
-affine latent-mean model, which is kept as the ablation baseline.
+"""Train a signature-conditioned affine latent mean model on minute OHLCV bars.
 
 Research scope
 --------------
@@ -27,7 +24,6 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-import scipy.special as special
 import scipy.stats as stats
 import torch
 import torch.nn as nn
@@ -102,28 +98,37 @@ STATE_CONTEXT_DIM = 7
 DIRECTIONAL_MULTISCALE_CONTEXT_DIM = len(DIRECTIONAL_MULTISCALE_COLUMNS)
 CLV_DENOMINATOR_EPS = 1e-12
 RAW_COLUMNS = {"timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap"}
-# Fixed GICS sectors for every supported research universe (see universe.py).
-# They are part of the feature specification rather than a live vendor lookup.
-# V and MA are Financials under the March 2023 GICS reclassification.
-from universe import SECTOR_BY_SYMBOL  # noqa: E402
-SECTOR_MEDIAN_SHRINKAGE_COUNT = 5.0
-# Cross-ticker PCA memory bound (elements of the windows x area-columns matrix).
-PCA_MAX_MATRIX_ELEMENTS = 150_000_000
-PCA_MIN_FIT_WINDOWS = 4_000
-# Universes above this size store engineered features in float32 to save memory.
-FLOAT32_FEATURE_SYMBOL_THRESHOLD = 50
-JUMP_MODES = ("none", "merton", "student_t")
-PREDICTIVE_PARAMETER_COLUMNS = {
-    "mean": "pred_mu",
-    "gaussian_variance": "pred_gvar",
-    "jump_intensity": "pred_jump_intensity",
-    "jump_variance": "pred_jump_var",
-    "dof": "pred_dof",
+# Fixed GICS-style sectors for the configured 25-stock research universe.  They
+# are part of the feature specification rather than a live vendor lookup, so a
+# future universe change must explicitly add its sector labels.
+SECTOR_BY_SYMBOL = {
+    "AAPL": "Information Technology",
+    "MSFT": "Information Technology",
+    "NVDA": "Information Technology",
+    "AVGO": "Information Technology",
+    "AMD": "Information Technology",
+    "INTC": "Information Technology",
+    "ORCL": "Information Technology",
+    "CRM": "Information Technology",
+    "V": "Information Technology",
+    "MA": "Information Technology",
+    "GOOGL": "Communication Services",
+    "META": "Communication Services",
+    "NFLX": "Communication Services",
+    "AMZN": "Consumer Discretionary",
+    "TSLA": "Consumer Discretionary",
+    "HD": "Consumer Discretionary",
+    "JPM": "Financials",
+    "BAC": "Financials",
+    "GS": "Financials",
+    "MS": "Financials",
+    "WMT": "Consumer Staples",
+    "COST": "Consumer Staples",
+    "JNJ": "Health Care",
+    "UNH": "Health Care",
+    "XOM": "Energy",
 }
-
-
-def _inverse_softplus(value: float) -> float:
-    return float(value + math.log(-math.expm1(-value)))
+SECTOR_MEDIAN_SHRINKAGE_COUNT = 5.0
 
 
 @dataclass(frozen=True)
@@ -165,26 +170,6 @@ class RunConfig:
     deterministic: bool = True
     seed: int = 42
     ensemble_seeds: tuple[int, ...] = (42,)
-    # Linear latent SDE.  0 = original deterministic affine-mean model (ablation).
-    sde_diffusion_rank: int = 0
-    sde_diffusion_floor: float = 1e-4
-    # Total loss = rank loss + weight * Gaussian NLL of the standardised target.
-    sde_nll_weight: float = 0.1
-    sde_target_clip: float = 8.0
-    # Ungated one-way cost grid for the mean vs uncertainty-scaled score comparison.
-    sde_cost_curve_bps: tuple[float, ...] = (0.0, 0.3, 0.6, 1.0, 1.5, 2.0)
-    # Heavy-tailed holding-period component: "none", "merton" or "student_t".
-    sde_jump_mode: str = "none"
-    sde_jump_max_count: int = 8
-    sde_jump_initial_intensity: float = 0.05
-    sde_jump_initial_std: float = 2.0
-    # False while tuning: the test split is never scored, and the execution /
-    # gate / OOS evaluation is skipped.  Set True once for the final frozen run.
-    evaluate_test: bool = True
-    # Demean scores within sector in the rank loss and the validation IC, so the
-    # training objective and checkpoint selection measure the within-sector
-    # ranking that the ensemble and sector-neutral portfolio use.
-    sector_neutral_objective: bool = True
 
 
 def set_global_seed(seed: int, deterministic: bool, allow_tf32: bool) -> None:
@@ -347,29 +332,6 @@ def sector_relative_return_feature_spec(
     }
 
 
-def drop_incomplete_sessions(bars: pd.DataFrame) -> pd.DataFrame:
-    """Remove sessions whose data stop before the market closed.
-
-    A session's close is the last bar across the whole universe.  Regular early
-    closes end at 13:00 New York time, so any session ending before 12:59 is
-    incomplete; the final session in the data must reach 15:59, which removes a
-    trading day that was still in progress when the data were downloaded (each
-    ticker would otherwise carry a different number of its minutes).
-    """
-    if "session" not in bars.columns:
-        raise ValueError("drop_incomplete_sessions needs a session column.")
-    last_bar = bars.groupby("session")["timestamp"].max().dt.tz_convert("America/New_York")
-    last_minute = last_bar.dt.hour * 60 + last_bar.dt.minute
-    incomplete = last_minute < 12 * 60 + 59
-    if len(last_minute):
-        final_session = last_minute.index.max()
-        incomplete.loc[final_session] = bool(incomplete.loc[final_session] or last_minute.loc[final_session] < 15 * 60 + 59)
-    dropped = sorted(incomplete.index[incomplete])
-    if dropped:
-        print(f"Dropping incomplete session(s) (data end before the close): {dropped}")
-    return bars[~bars["session"].isin(dropped)]
-
-
 def engineer_minute_features(
     bars: pd.DataFrame,
     holding_minutes: int,
@@ -379,7 +341,6 @@ def engineer_minute_features(
     prepared = bars.copy()
     timestamp_ny = prepared["timestamp"].dt.tz_convert("America/New_York")
     prepared["session"] = timestamp_ny.dt.date.astype(str)
-    prepared = drop_incomplete_sessions(prepared)
     frame = _expand_to_session_grid(prepared)
     sector_spec = sector_relative_return_feature_spec(
         frame["symbol"].unique(), sector_median_shrinkage_count
@@ -469,9 +430,6 @@ def engineer_minute_features(
         forward_sector_count.ge(2)
     )
     frame["input_available"] = frame[list(FEATURE_COLUMNS)].notna().all(axis=1)
-    if frame["symbol"].nunique() > FLOAT32_FEATURE_SYMBOL_THRESHOLD:
-        # Model inputs are float32 anyway; labels and prices stay float64.
-        frame[list(FEATURE_COLUMNS)] = frame[list(FEATURE_COLUMNS)].astype(np.float32)
     if not frame["input_available"].any():
         raise ValueError("No usable feature paths after feature construction. Check the raw minute bars.")
     return frame.sort_values(["session", "timestamp", "symbol"]).reset_index(drop=True)
@@ -745,12 +703,7 @@ class CrossSectionalMinuteDataset(Dataset):
                 )
         return records
 
-    def prediction_records(
-        self,
-        sample_indices: Iterable[int],
-        prediction: np.ndarray,
-        extra_columns: dict[str, np.ndarray] | None = None,
-    ) -> list[dict[str, object]]:
+    def prediction_records(self, sample_indices: Iterable[int], prediction: np.ndarray) -> list[dict[str, object]]:
         """Attach predictions without assuming every symbol has a valid label."""
         records: list[dict[str, object]] = []
         for batch_index, sample_index in enumerate(sample_indices):
@@ -758,39 +711,29 @@ class CrossSectionalMinuteDataset(Dataset):
             for symbol_index, symbol in enumerate(self.symbols):
                 if not self.target_masks[end, symbol_index]:
                     continue
-                record = {
-                    "session": self.sessions[end],
-                    "timestamp": self.timestamps[end],
-                    "symbol": symbol,
-                    "sector": SECTOR_BY_SYMBOL[symbol],
-                    "target_return": float(self.raw_targets[end, symbol_index]),
-                    "rank_target_return": float(self.rank_targets[end, symbol_index]),
-                    "entry_price": float(self.entry_prices[end, symbol_index]),
-                    "exit_price": float(self.exit_prices[end, symbol_index]),
-                    "prediction": float(prediction[batch_index, symbol_index]),
-                }
-                for column, values in (extra_columns or {}).items():
-                    record[column] = float(values[batch_index, symbol_index])
-                records.append(record)
+                records.append(
+                    {
+                        "session": self.sessions[end],
+                        "timestamp": self.timestamps[end],
+                        "symbol": symbol,
+                        "sector": SECTOR_BY_SYMBOL[symbol],
+                        "target_return": float(self.raw_targets[end, symbol_index]),
+                        "rank_target_return": float(self.rank_targets[end, symbol_index]),
+                        "entry_price": float(self.entry_prices[end, symbol_index]),
+                        "exit_price": float(self.exit_prices[end, symbol_index]),
+                        "prediction": float(prediction[batch_index, symbol_index]),
+                    }
+                )
         return records
 
-    def cross_ticker_area_matrix(
-        self, batch_size: int = 256, sample_positions: np.ndarray | None = None
-    ) -> np.ndarray:
-        """Materialise raw selected area vectors for PCA, using this split only.
-
-        ``sample_positions`` selects a subset of this split's windows (used to bound
-        memory for large universes).
-        """
+    def cross_ticker_area_matrix(self, batch_size: int = 256) -> np.ndarray:
+        """Materialise raw selected area vectors for PCA, using this split only."""
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
         offsets = np.arange(-self.window_minutes + 1, 1, dtype=np.int64)
-        end_indices = (
-            self.sample_end_indices if sample_positions is None else self.sample_end_indices[sample_positions]
-        )
         batches: list[np.ndarray] = []
-        for start in range(0, len(end_indices), batch_size):
-            ends = end_indices[start : start + batch_size]
+        for start in range(0, len(self.sample_end_indices), batch_size):
+            ends = self.sample_end_indices[start : start + batch_size]
             paths = self.x[ends[:, None] + offsets[None, :]]
             # self.x is [time, symbols, features]; areas expect [batch, symbols, time, features].
             batches.append(_cross_ticker_areas_numpy(np.transpose(paths, (0, 2, 1, 3))))
@@ -807,8 +750,6 @@ class CrossTickerAreaPCA:
     price_volume_scale: np.ndarray
     price_volume_components: np.ndarray
     price_volume_explained_variance_ratio: np.ndarray
-    fit_window_count: int = 0
-    fit_window_subsampled: bool = False
 
 
 def _fit_standardized_pca(
@@ -818,10 +759,10 @@ def _fit_standardized_pca(
     maximum_components = min(values.shape)
     if components < 1 or components > maximum_components:
         raise ValueError(f"{feature_group} PCA components must be in [1, {maximum_components}].")
-    mean = values.mean(axis=0, dtype=np.float64)
-    scale = values.std(axis=0, ddof=0, dtype=np.float64)
+    mean = values.mean(axis=0)
+    scale = values.std(axis=0, ddof=0)
     scale = np.where(scale > 1e-12, scale, 1.0)
-    standardised = ((values - mean) / scale).astype(values.dtype, copy=False)
+    standardised = (values - mean) / scale
     _left, singular_values, right_vectors = np.linalg.svd(standardised, full_matrices=False)
     explained_variance = np.square(singular_values) / max(len(standardised) - 1, 1)
     total_variance = explained_variance.sum()
@@ -841,29 +782,11 @@ def fit_cross_ticker_area_pca(
     price_price_components: int,
     price_volume_components: int,
 ) -> CrossTickerAreaPCA:
-    """PCA-compress both cross-ticker area families using training windows only.
-
-    The raw area matrix has N(N-1)/2 + N(N-1) columns, i.e. ~15k for 100 names.  When
-    windows x columns exceeds ``PCA_MAX_MATRIX_ELEMENTS`` the PCA is fitted on evenly
-    spaced training windows (deterministic) in float32; smaller universes keep the
-    exact all-window float64 fit used before.
-    """
-    num_symbols = len(dataset.symbols)
-    area_columns = num_symbols * (num_symbols - 1) // 2 + num_symbols * (num_symbols - 1)
-    window_count = len(dataset)
-    sample_positions = None
-    if window_count * area_columns > PCA_MAX_MATRIX_ELEMENTS:
-        keep = max(PCA_MIN_FIT_WINDOWS, int(PCA_MAX_MATRIX_ELEMENTS // area_columns))
-        sample_positions = np.unique(np.linspace(0, window_count - 1, min(keep, window_count)).astype(np.int64))
-        print(
-            f"Cross-ticker PCA: fitting on {len(sample_positions):,} of {window_count:,} training windows "
-            f"({area_columns:,} raw area columns) to bound memory."
-        )
-    raw_areas = dataset.cross_ticker_area_matrix(sample_positions=sample_positions)
-    if sample_positions is not None:
-        raw_areas = raw_areas.astype(np.float32, copy=False)
+    """PCA-compress both cross-ticker area families using training windows only."""
+    raw_areas = dataset.cross_ticker_area_matrix()
     if not np.isfinite(raw_areas).all():
         raise ValueError("Training cross-ticker areas contain non-finite values.")
+    num_symbols = len(dataset.symbols)
     price_price_dim = num_symbols * (num_symbols - 1) // 2
     price_price_areas = raw_areas[:, :price_price_dim]
     price_volume_areas = raw_areas[:, price_price_dim:]
@@ -888,8 +811,6 @@ def fit_cross_ticker_area_pca(
         price_volume_scale=price_volume_scale,
         price_volume_components=price_volume_projection,
         price_volume_explained_variance_ratio=price_volume_explained_variance_ratio,
-        fit_window_count=int(len(raw_areas)),
-        fit_window_subsampled=sample_positions is not None,
     )
 
 
@@ -913,34 +834,6 @@ class SignatureConditionedAffineMeanModel(nn.Module):
     and the alpha readout is linear in ``m(1)``.  The augmented matrix exponential
     computes that endpoint exactly, so the Rank-IC objective never receives
     Brownian Monte Carlo noise.
-
-    With ``diffusion_rank > 0`` the latent state is a linear (Ornstein-Uhlenbeck
-    type) SDE with context-dependent coefficients,
-
-        dZ_t = (A(c) Z_t + b(c)) dt + G(c) dW_t,   Z_0 = m_0,   G(c) in R^{d x r},
-
-    so Z_1 is Gaussian.  Its mean is the ODE endpoint above and its covariance
-
-        P(c) = int_0^1 exp(A s) G G^T exp(A^T s) ds
-
-    is evaluated exactly with Van Loan's block matrix exponential.  The forecast
-    y = w^T Z_1 + q + eps, eps ~ N(0, sigma_obs^2), therefore has the closed-form
-    predictive law N(w^T m_1 + q, w^T P w + sigma_obs^2).  ``sigma_obs`` is a single
-    global parameter, so every context-dependent (heteroskedastic) part of the
-    predictive variance must pass through the latent diffusion.  Training,
-    validation and inference remain free of Monte Carlo noise.  ``diffusion_rank=0``
-    reproduces the original deterministic model and its checkpoints exactly.
-
-    ``jump_mode`` adds a heavy-tailed component over the holding period:
-
-    * ``"merton"``: y = w^T Z_1 + q + eps + sum_{i<=N} xi_i with
-      N ~ Poisson(lambda(c)) and xi_i ~ N(0, s_J(c)^2).  The jump mean is fixed at
-      zero (the target is sector-neutral), so jumps change the predictive law but
-      not the mean or the ranking.  The likelihood is the exact Poisson mixture
-      sum_k Pois(k; lambda) N(y; mu, v + k s_J^2), truncated at ``jump_max_count``.
-    * ``"student_t"``: a Student-t law with the Gaussian variance v and a global
-      learned degrees of freedom nu > 2 (a continuous normal-variance mixture),
-      kept as a low-cost control for the Merton specification.
     """
 
     def __init__(
@@ -951,26 +844,8 @@ class SignatureConditionedAffineMeanModel(nn.Module):
         hidden_dim: int,
         num_symbols: int,
         cross_area_pca: CrossTickerAreaPCA,
-        diffusion_rank: int = 0,
-        diffusion_floor: float = 1e-4,
-        jump_mode: str = "none",
-        jump_initial_intensity: float = 0.05,
-        jump_initial_std: float = 2.0,
     ) -> None:
         super().__init__()
-        if jump_mode not in JUMP_MODES:
-            raise ValueError(f"jump_mode must be one of {JUMP_MODES}.")
-        if jump_mode != "none" and diffusion_rank <= 0:
-            raise ValueError("A jump or Student-t component requires diffusion_rank > 0.")
-        if not jump_initial_intensity > 0.0 or not jump_initial_std > 0.0:
-            raise ValueError("Initial jump intensity and jump standard deviation must be positive.")
-        self.jump_mode = jump_mode
-        if diffusion_rank < 0:
-            raise ValueError("diffusion_rank must be non-negative.")
-        if diffusion_floor < 0.0:
-            raise ValueError("diffusion_floor must be non-negative.")
-        self.diffusion_rank = int(diffusion_rank)
-        self.diffusion_floor = float(diffusion_floor)
         if num_symbols < 3:
             raise ValueError("Cross-ticker areas require at least three symbols.")
         if signature_depth != 2:
@@ -1048,42 +923,6 @@ class SignatureConditionedAffineMeanModel(nn.Module):
         # alpha only through the affine latent dynamics, not through a direct
         # signature-to-alpha shortcut.
         self.readout = nn.Linear(latent_dim, 1)
-        if self.diffusion_rank > 0:
-            # A separate head keeps diffusion_rank=0 state_dicts identical to the
-            # original deterministic model.
-            self.diffusion_network = nn.Sequential(
-                nn.LayerNorm(self.context_dim),
-                nn.Linear(self.context_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, latent_dim * self.diffusion_rank),
-            )
-            # Start with a small diffusion so early training is driven by the rank
-            # objective; the NLL term then grows the volatility it can explain.
-            nn.init.normal_(self.diffusion_network[-1].weight, std=1e-3)
-            nn.init.constant_(self.diffusion_network[-1].bias, 0.1 / math.sqrt(latent_dim * self.diffusion_rank))
-            # Global homoskedastic observation noise, log-parameterised.
-            self.log_observation_std = nn.Parameter(torch.tensor(0.0))
-        if self.jump_mode == "merton":
-            # Context-dependent jump intensity lambda(c) and jump variance s_J(c)^2.
-            self.jump_network = nn.Sequential(
-                nn.LayerNorm(self.context_dim),
-                nn.Linear(self.context_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, 2),
-            )
-            nn.init.normal_(self.jump_network[-1].weight, std=1e-3)
-            with torch.no_grad():
-                self.jump_network[-1].bias.copy_(
-                    torch.tensor(
-                        [
-                            _inverse_softplus(jump_initial_intensity),
-                            _inverse_softplus(jump_initial_std**2),
-                        ]
-                    )
-                )
-        elif self.jump_mode == "student_t":
-            # nu = 2 + exp(theta) keeps the variance finite; start at nu = 8.
-            self.log_dof_minus_two = nn.Parameter(torch.tensor(math.log(6.0)))
 
     @staticmethod
     def _selective_lead_lag(path: torch.Tensor) -> torch.Tensor:
@@ -1214,68 +1053,7 @@ class SignatureConditionedAffineMeanModel(nn.Module):
         drift_matrix = skew - torch.diag_embed(decay)
         return drift_matrix, drift_intercept
 
-    @property
-    def has_diffusion(self) -> bool:
-        return self.diffusion_rank > 0
-
-    def _diffusion_matrix(self, context: torch.Tensor) -> torch.Tensor:
-        """Context-conditioned low-rank diffusion loading G(c), shape [n, d, r]."""
-        return self.diffusion_network(context).view(-1, self.latent_dim, self.diffusion_rank)
-
-    @staticmethod
-    def van_loan_covariance(drift_matrix: torch.Tensor, diffusion_covariance: torch.Tensor) -> torch.Tensor:
-        """Exact P = int_0^1 exp(A s) Q exp(A^T s) ds via one block matrix exponential.
-
-        With C = [[-A, Q], [0, A^T]] and exp(C) = [[F11, F12], [0, F22]],
-        F22 = exp(A^T) and P = F22^T F12 (Van Loan, 1978).
-        """
-        n, d, _ = drift_matrix.shape
-        block = torch.zeros(n, 2 * d, 2 * d, device=drift_matrix.device, dtype=drift_matrix.dtype)
-        block[:, :d, :d] = -drift_matrix
-        block[:, :d, d:] = diffusion_covariance
-        block[:, d:, d:] = drift_matrix.transpose(-1, -2)
-        exponential = torch.matrix_exp(block)
-        covariance = exponential[:, d:, d:].transpose(-1, -2) @ exponential[:, :d, d:]
-        # Remove the O(machine-epsilon) asymmetry left by floating point.
-        return 0.5 * (covariance + covariance.transpose(-1, -2))
-
     def forward(self, path: torch.Tensor) -> torch.Tensor:
-        """Conditional-mean alpha score, shape [batch, symbols]."""
-        mean, _, _ = self._latent_endpoint(path, need_covariance=False)
-        return mean
-
-    def forward_predictive(self, path: torch.Tensor) -> dict[str, torch.Tensor]:
-        """All predictive-law parameters, each [batch, symbols].
-
-        Keys: ``mean``, ``gaussian_variance`` (diffusion + observation noise),
-        ``total_variance``; plus ``jump_intensity`` and ``jump_variance`` (Merton)
-        or ``dof`` (Student-t).
-        """
-        if not self.has_diffusion:
-            raise RuntimeError("forward_predictive requires diffusion_rank > 0.")
-        mean, gaussian_variance, context = self._latent_endpoint(path, need_covariance=True)
-        assert gaussian_variance is not None
-        result = {"mean": mean, "gaussian_variance": gaussian_variance, "total_variance": gaussian_variance}
-        if self.jump_mode == "merton":
-            raw = self.jump_network(context).float()
-            intensity = torch.nn.functional.softplus(raw[:, 0]).view_as(mean) + 1e-6
-            jump_variance = torch.nn.functional.softplus(raw[:, 1]).view_as(mean) + 1e-4
-            result["jump_intensity"] = intensity
-            result["jump_variance"] = jump_variance
-            result["total_variance"] = gaussian_variance + intensity * jump_variance
-        elif self.jump_mode == "student_t":
-            dof = 2.0 + torch.exp(self.log_dof_minus_two.float())
-            result["dof"] = dof.expand_as(mean)
-        return result
-
-    def forward_distribution(self, path: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predictive mean and total variance, each [batch, symbols]."""
-        parameters = self.forward_predictive(path)
-        return parameters["mean"], parameters["total_variance"]
-
-    def _latent_endpoint(
-        self, path: torch.Tensor, need_covariance: bool
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         if path.ndim != 4:
             raise ValueError("Expected path with shape [batch, symbols, time, features].")
         batch_size, num_symbols, path_length, input_channels = path.shape
@@ -1325,337 +1103,18 @@ class SignatureConditionedAffineMeanModel(nn.Module):
             torch.bmm(transition[:, : self.latent_dim, : self.latent_dim], initial_state.unsqueeze(-1)).squeeze(-1)
             + transition[:, : self.latent_dim, self.latent_dim]
         )
-        mean = self.readout(mean_endpoint).view(batch_size, num_symbols)
-        if not need_covariance:
-            return mean, None, context
-
-        loading = self._diffusion_matrix(context).float()
-        diffusion_covariance = loading @ loading.transpose(-1, -2)
-        if self.diffusion_floor > 0.0:
-            diffusion_covariance = diffusion_covariance + self.diffusion_floor * torch.eye(
-                self.latent_dim, device=path.device, dtype=torch.float32
-            )
-        latent_covariance = self.van_loan_covariance(drift_matrix, diffusion_covariance)
-        readout_weight = self.readout.weight.float().view(1, self.latent_dim, 1)
-        diffusion_variance = (readout_weight.transpose(1, 2) @ latent_covariance @ readout_weight).view(
-            batch_size, num_symbols
-        )
-        observation_variance = torch.exp(2.0 * self.log_observation_std.float())
-        variance = diffusion_variance.clamp_min(0.0) + observation_variance
-        return mean, variance, context
-
-
-class GaussianPredictiveNLL(nn.Module):
-    """Masked Gaussian negative log-likelihood of the standardised sector-excess return.
-
-    The target is divided by a fixed train-split scale so that the model's mean and
-    variance are O(1).  Standardised targets are clipped at +/- ``target_clip`` so a
-    handful of event-driven jumps cannot dominate the variance head.
-    """
-
-    def __init__(self, target_scale: float, target_clip: float) -> None:
-        super().__init__()
-        if not target_scale > 0.0:
-            raise ValueError("target_scale must be positive.")
-        if not target_clip > 0.0:
-            raise ValueError("target_clip must be positive.")
-        self.target_scale = float(target_scale)
-        self.target_clip = float(target_clip)
-
-    def forward(
-        self, mean: torch.Tensor, variance: torch.Tensor, target: torch.Tensor, target_mask: torch.Tensor
-    ) -> torch.Tensor:
-        mask = target_mask.to(dtype=mean.dtype)
-        standardised = (target / self.target_scale).clamp(-self.target_clip, self.target_clip)
-        variance = variance.clamp_min(1e-6)
-        nll = 0.5 * (torch.log(2.0 * math.pi * variance) + (standardised - mean).square() / variance)
-        return (nll * mask).sum() / mask.sum().clamp_min(1.0)
-
-
-class PredictiveNLL(nn.Module):
-    """Masked NLL of the standardised target under the model's predictive law.
-
-    ``mode="none"``: Gaussian N(mu, v).
-    ``mode="merton"``: exact Poisson mixture sum_k Pois(k; lambda) N(mu, v + k s_J^2),
-    truncated at ``max_jumps`` (the omitted Poisson mass is reported by the
-    diagnostics).
-    ``mode="student_t"``: Student-t with variance v and degrees of freedom nu.
-    """
-
-    def __init__(self, target_scale: float, target_clip: float, mode: str = "none", max_jumps: int = 8) -> None:
-        super().__init__()
-        if mode not in JUMP_MODES:
-            raise ValueError(f"mode must be one of {JUMP_MODES}.")
-        if not target_scale > 0.0 or not target_clip > 0.0:
-            raise ValueError("target_scale and target_clip must be positive.")
-        if max_jumps < 1:
-            raise ValueError("max_jumps must be at least 1.")
-        self.target_scale = float(target_scale)
-        self.target_clip = float(target_clip)
-        self.mode = mode
-        self.max_jumps = int(max_jumps)
-
-    def per_label_nll(self, parameters: dict[str, torch.Tensor], target: torch.Tensor) -> torch.Tensor:
-        y = (target.float() / self.target_scale).clamp(-self.target_clip, self.target_clip)
-        mean = parameters["mean"].float()
-        variance = parameters["gaussian_variance"].float().clamp_min(1e-6)
-        squared_error = (y - mean).square()
-        if self.mode == "none":
-            return 0.5 * (torch.log(2.0 * math.pi * variance) + squared_error / variance)
-        if self.mode == "merton":
-            intensity = parameters["jump_intensity"].float().clamp_min(1e-8)
-            jump_variance = parameters["jump_variance"].float()
-            counts = torch.arange(self.max_jumps + 1, device=y.device, dtype=y.dtype).view(-1, *([1] * y.ndim))
-            component_variance = variance.unsqueeze(0) + counts * jump_variance.unsqueeze(0)
-            log_poisson = counts * torch.log(intensity).unsqueeze(0) - intensity.unsqueeze(0) - torch.lgamma(counts + 1.0)
-            log_normal = -0.5 * (
-                torch.log(2.0 * math.pi * component_variance) + squared_error.unsqueeze(0) / component_variance
-            )
-            return -torch.logsumexp(log_poisson + log_normal, dim=0)
-        dof = parameters["dof"].float()
-        scale_squared = variance * (dof - 2.0) / dof
-        return -(
-            torch.lgamma(0.5 * (dof + 1.0))
-            - torch.lgamma(0.5 * dof)
-            - 0.5 * torch.log(dof * math.pi * scale_squared)
-            - 0.5 * (dof + 1.0) * torch.log1p(squared_error / (dof * scale_squared))
-        )
-
-    def forward(
-        self, parameters: dict[str, torch.Tensor], target: torch.Tensor, target_mask: torch.Tensor
-    ) -> torch.Tensor:
-        mask = target_mask.to(dtype=torch.float32)
-        nll = self.per_label_nll(parameters, target)
-        return (nll * mask).sum() / mask.sum().clamp_min(1.0)
-
-
-def fit_sde_target_scale(dataset: "CrossSectionalMinuteDataset") -> float:
-    """Robust train-only scale of the sector-excess forward return (1.4826 x MAD)."""
-    ends = dataset.sample_end_indices
-    values = dataset.rank_targets[ends][dataset.target_masks[ends]].astype(np.float64)
-    if values.size < 10:
-        raise ValueError("Too few training labels to fit the SDE target scale.")
-    scale = 1.4826 * float(np.median(np.abs(values - np.median(values))))
-    if not scale > 0.0:
-        scale = float(values.std())
-    if not scale > 0.0:
-        raise ValueError("Training sector-excess returns have zero dispersion.")
-    return scale
-
-
-def per_symbol_baseline_variance(dataset: "CrossSectionalMinuteDataset", target_scale: float, target_clip: float) -> dict[str, float]:
-    """Train-only, homoskedastic per-symbol variance of the standardised target (benchmark)."""
-    ends = dataset.sample_end_indices
-    targets = np.clip(dataset.rank_targets[ends] / target_scale, -target_clip, target_clip)
-    masks = dataset.target_masks[ends]
-    baseline: dict[str, float] = {}
-    for symbol_index, symbol in enumerate(dataset.symbols):
-        values = targets[masks[:, symbol_index], symbol_index]
-        baseline[symbol] = float(np.mean(np.square(values))) if values.size else float("nan")
-    return baseline
-
-
-def _predictive_components(frame: pd.DataFrame) -> list[dict[str, np.ndarray]]:
-    """Exact law parameters per ensemble member (or one member for a seed frame)."""
-    seed_tags = sorted({column.split("__seed")[1] for column in frame.columns if column.startswith("pred_mu__seed")})
-    suffixes = [f"__seed{tag}" for tag in seed_tags] if seed_tags else [""]
-    components: list[dict[str, np.ndarray]] = []
-    for suffix in suffixes:
-        component: dict[str, np.ndarray] = {}
-        for column in PREDICTIVE_PARAMETER_COLUMNS.values():
-            if f"{column}{suffix}" in frame.columns:
-                component[column] = frame[f"{column}{suffix}"].to_numpy(dtype=float)
-        if "pred_mu" not in component or "pred_gvar" not in component:
-            component = {}
-        components.append(component)
-    if not components or not components[0]:
-        # Older runs: only the first two moments were saved; use a moment-matched Gaussian.
-        return [
-            {
-                "pred_mu": frame["predicted_mean_std"].to_numpy(dtype=float),
-                "pred_gvar": frame["predicted_variance_std"].to_numpy(dtype=float),
-            }
-        ]
-    return components
-
-
-def _component_logpdf_cdf(
-    y: np.ndarray, component: dict[str, np.ndarray], jump_mode: str, max_jumps: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """Log density, CDF and (Merton only) log density of the no-jump term."""
-    mu = component["pred_mu"]
-    variance = np.maximum(component["pred_gvar"], 1e-12)
-    if jump_mode == "merton" and "pred_jump_intensity" in component:
-        intensity = np.maximum(component["pred_jump_intensity"], 1e-12)
-        jump_variance = component["pred_jump_var"]
-        counts = np.arange(max_jumps + 1)[:, None]
-        component_variance = variance[None, :] + counts * jump_variance[None, :]
-        log_poisson = counts * np.log(intensity)[None, :] - intensity[None, :] - special.gammaln(counts + 1.0)
-        log_normal = stats.norm.logpdf(y[None, :], loc=mu[None, :], scale=np.sqrt(component_variance))
-        joint = log_poisson + log_normal
-        weights = np.exp(log_poisson)
-        cdf = (weights * stats.norm.cdf(y[None, :], loc=mu[None, :], scale=np.sqrt(component_variance))).sum(axis=0)
-        return special.logsumexp(joint, axis=0), cdf, joint[0]
-    if jump_mode == "student_t" and "pred_dof" in component:
-        dof = component["pred_dof"]
-        scale = np.sqrt(variance * (dof - 2.0) / dof)
-        return stats.t.logpdf(y, dof, loc=mu, scale=scale), stats.t.cdf(y, dof, loc=mu, scale=scale), None
-    scale = np.sqrt(variance)
-    return stats.norm.logpdf(y, loc=mu, scale=scale), stats.norm.cdf(y, loc=mu, scale=scale), None
-
-
-def evaluate_predictive_distribution(
-    frame: pd.DataFrame,
-    target_scale: float,
-    target_clip: float,
-    baseline_variance_by_symbol: dict[str, float] | None = None,
-    jump_mode: str = "none",
-    max_jumps: int = 8,
-) -> dict[str, object]:
-    """Calibration, sharpness and jump diagnostics for the predictive law.
-
-    The density of an ensemble frame is the exact equal-weight mixture of its
-    seeds' laws (Gaussian, Merton Poisson mixture or Student-t).  Reports NLL
-    against a homoskedastic per-symbol Gaussian benchmark, PIT calibration,
-    central-interval coverage including the 99% and 99.9% tails, and a
-    Mincer-Zarnowitz regression of squared errors on predicted total variance.
-    Merton runs also get intensity summaries and posterior jump probabilities.
-    """
-    required = {"rank_target_return", "predicted_mean_std", "predicted_variance_std", "symbol", "session"}
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"Prediction frame is missing distribution columns: {sorted(missing)}")
-    y = np.clip(frame["rank_target_return"].to_numpy(dtype=float) / target_scale, -target_clip, target_clip)
-    mu = frame["predicted_mean_std"].to_numpy(dtype=float)
-    var = np.maximum(frame["predicted_variance_std"].to_numpy(dtype=float), 1e-12)
-    residual = y - mu
-    z = residual / np.sqrt(var)
-
-    components = _predictive_components(frame)
-    evaluated = [_component_logpdf_cdf(y, component, jump_mode, max_jumps) for component in components]
-    log_density = special.logsumexp(np.stack([item[0] for item in evaluated]), axis=0) - np.log(len(evaluated))
-    pit = np.clip(np.mean(np.stack([item[1] for item in evaluated]), axis=0), 0.0, 1.0)
-    nll = -log_density
-
-    coverage = {}
-    for level in (0.5, 0.8, 0.9, 0.95, 0.99, 0.999):
-        coverage[f"{level * 100:g}%"] = float(np.mean(np.abs(pit - 0.5) <= level / 2.0))
-    pit_histogram = np.histogram(pit, bins=10, range=(0.0, 1.0))[0] / len(pit)
-    design = np.column_stack([np.ones_like(var), var])
-    (mz_intercept, mz_slope), *_ = np.linalg.lstsq(design, residual**2, rcond=None)
-    mz_r2 = float(np.corrcoef(var, residual**2)[0, 1] ** 2) if np.std(var) > 0 else float("nan")
-    result: dict[str, object] = {
-        "observations": int(len(y)),
-        "jump_mode": jump_mode,
-        "density": "exact equal-weight mixture over seeds" if len(components) > 1 else "single model",
-        "target_units": "sector-excess forward return / train-only robust scale, clipped",
-        "target_scale": float(target_scale),
-        "target_clip": float(target_clip),
-        "fraction_targets_at_clip": float(np.mean(np.abs(y) >= target_clip)),
-        "mean_nll": float(nll.mean()),
-        "standardised_residual_mean": float(z.mean()),
-        "standardised_residual_std": float(z.std()),
-        "central_interval_coverage": coverage,
-        "pit_histogram_10_bins": [float(value) for value in pit_histogram],
-        "pit_ks_statistic": float(stats.kstest(pit, "uniform").statistic),
-        "mincer_zarnowitz": {"intercept": float(mz_intercept), "slope": float(mz_slope), "r2": mz_r2},
-        "spearman_predicted_std_vs_abs_residual": float(
-            stats.spearmanr(np.sqrt(var), np.abs(residual)).correlation
-        ),
-        "spearman_predicted_std_vs_abs_target": float(stats.spearmanr(np.sqrt(var), np.abs(y)).correlation),
-        "warning": "PIT/coverage pool dependent intraday observations; treat as descriptive diagnostics.",
-    }
-
-    if jump_mode == "merton" and all("pred_jump_intensity" in component for component in components):
-        intensity = np.mean(np.stack([component["pred_jump_intensity"] for component in components]), axis=0)
-        jump_std = np.sqrt(np.mean(np.stack([component["pred_jump_var"] for component in components]), axis=0))
-        no_jump_log = special.logsumexp(np.stack([item[2] for item in evaluated]), axis=0) - np.log(len(evaluated))
-        posterior_jump = 1.0 - np.exp(np.minimum(no_jump_log - log_density, 0.0))
-        truncated_mass = np.max(
-            [float(stats.poisson.sf(max_jumps, component["pred_jump_intensity"]).max()) for component in components]
-        )
-        jump_share = intensity * jump_std**2 / var
-        timestamps = pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert("America/New_York")
-        bucket = timestamps.dt.strftime("%H:%M")
-        abs_y = np.abs(y)
-        result["jumps"] = {
-            "mean_intensity_per_period": float(intensity.mean()),
-            "intensity_quantiles_5_50_95": [float(value) for value in np.quantile(intensity, [0.05, 0.5, 0.95])],
-            "mean_jump_std": float(jump_std.mean()),
-            "mean_jump_share_of_total_variance": float(jump_share.mean()),
-            "mean_posterior_jump_probability": float(posterior_jump.mean()),
-            "posterior_jump_probability_by_abs_target": {
-                "|y|<1": float(posterior_jump[abs_y < 1].mean()) if (abs_y < 1).any() else float("nan"),
-                "1<=|y|<3": float(posterior_jump[(abs_y >= 1) & (abs_y < 3)].mean())
-                if ((abs_y >= 1) & (abs_y < 3)).any()
-                else float("nan"),
-                "3<=|y|<5": float(posterior_jump[(abs_y >= 3) & (abs_y < 5)].mean())
-                if ((abs_y >= 3) & (abs_y < 5)).any()
-                else float("nan"),
-                "|y|>=5": float(posterior_jump[abs_y >= 5].mean()) if (abs_y >= 5).any() else float("nan"),
-            },
-            "spearman_intensity_vs_abs_target": float(stats.spearmanr(intensity, abs_y).correlation),
-            "spearman_intensity_vs_posterior_jump": float(stats.spearmanr(intensity, posterior_jump).correlation),
-            "mean_intensity_by_time_et": {
-                key: float(value) for key, value in pd.Series(intensity).groupby(bucket.to_numpy()).mean().items()
-            },
-            "mean_intensity_by_symbol": {
-                key: float(value)
-                for key, value in pd.Series(intensity).groupby(frame["symbol"].to_numpy()).mean().sort_values().items()
-            },
-            "max_truncated_poisson_mass": truncated_mass,
-        }
-    if jump_mode == "student_t" and all("pred_dof" in component for component in components):
-        result["student_t_dof_by_member"] = [float(np.median(component["pred_dof"])) for component in components]
-
-    if baseline_variance_by_symbol is not None:
-        baseline_var = np.maximum(frame["symbol"].map(baseline_variance_by_symbol).to_numpy(dtype=float), 1e-12)
-        baseline_nll = 0.5 * (np.log(2.0 * np.pi * baseline_var) + y**2 / baseline_var)
-        daily = (
-            pd.DataFrame({"session": frame["session"].to_numpy(), "gain": baseline_nll - nll})
-            .groupby("session")["gain"]
-            .mean()
-        )
-        rng = np.random.default_rng(0)
-        values = daily.to_numpy()
-        boot = values[rng.integers(0, len(values), size=(10_000, len(values)))].mean(axis=1)
-        result["baseline"] = "homoskedastic per-symbol train variance, zero mean, Gaussian"
-        result["baseline_mean_nll"] = float(baseline_nll.mean())
-        result["nll_improvement_vs_baseline"] = {
-            "mean_daily": float(values.mean()),
-            "ci_95_lower": float(np.quantile(boot, 0.025)),
-            "ci_95_upper": float(np.quantile(boot, 0.975)),
-            "days": int(len(values)),
-        }
-    return result
+        return self.readout(mean_endpoint).view(batch_size, num_symbols)
 
 
 class CrossSectionalRankLoss(nn.Module):
-    """Pearson correlation with hard-rank normal-score targets (Spearman surrogate).
+    """Pearson correlation with hard-rank normal-score targets (Spearman surrogate)."""
 
-    With ``sector_ids`` the prediction is first demeaned within each sector over
-    the valid names.  The target is already a within-sector excess return, so a
-    sector-level offset in the score cannot predict it; removing it makes the
-    loss measure the within-sector ranking that the ensemble and the
-    sector-neutral portfolio actually use.
-    """
-
-    def __init__(self, min_labelled_symbols: int, sector_ids: torch.Tensor | None = None) -> None:
+    def __init__(self, min_labelled_symbols: int) -> None:
         super().__init__()
         self.min_labelled_symbols = min_labelled_symbols
-        if sector_ids is not None:
-            one_hot = torch.nn.functional.one_hot(sector_ids.long()).to(torch.float32)
-            self.register_buffer("sector_one_hot", one_hot, persistent=False)
-        else:
-            self.sector_one_hot = None
 
     def forward(self, prediction: torch.Tensor, target: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
         mask = target_mask.to(dtype=prediction.dtype)
-        if self.sector_one_hot is not None:
-            one_hot = self.sector_one_hot.to(dtype=prediction.dtype)
-            sector_sum = (prediction * mask) @ one_hot
-            sector_count = (mask @ one_hot).clamp_min(1.0)
-            prediction = prediction - (sector_sum / sector_count) @ one_hot.transpose(0, 1)
         count = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
         prediction = (prediction - (prediction * mask).sum(dim=1, keepdim=True) / count) * mask
         normal_score_target = torch.zeros_like(target)
@@ -1690,34 +1149,15 @@ def _rank_ic(prediction: np.ndarray, target: np.ndarray) -> float:
     return float(stats.spearmanr(prediction, target).correlation)
 
 
-def _sector_demean(values: np.ndarray, sector_ids: np.ndarray) -> np.ndarray:
-    """Subtract each sector's mean from a 1-D score vector (valid names only)."""
-    result = np.asarray(values, dtype=float).copy()
-    for sector in np.unique(sector_ids):
-        members = sector_ids == sector
-        result[members] -= result[members].mean()
-    return result
-
-
 def _daily_rank_ic_from_prediction_frame(
-    frame: pd.DataFrame, target_column: str = "rank_target_return", sector_neutral: bool = True
+    frame: pd.DataFrame, target_column: str = "rank_target_return"
 ) -> pd.Series:
-    """Equal-weight each session after Rank IC against the requested forward target.
-
-    With ``sector_neutral`` (default) the score is demeaned within each sector at
-    each signal time first, matching the within-sector target and the
-    sector-neutral portfolio.  For scores that are already standardised within
-    sector (the ensemble) this is a no-op.
-    """
+    """Equal-weight each session after Rank IC against the requested forward target."""
     if target_column not in frame.columns:
         raise ValueError(f"Prediction frame is missing Rank-IC target column: {target_column}")
-    scores = frame["prediction"]
-    if sector_neutral and "sector" in frame.columns:
-        scores = scores - scores.groupby([frame["session"], frame["timestamp"], frame["sector"]]).transform("mean")
-    frame = frame.assign(_ic_score=scores.to_numpy())
     records: list[tuple[str, float]] = []
     for (session, _timestamp), group in frame.groupby(["session", "timestamp"], sort=True):
-        value = _rank_ic(group["_ic_score"].to_numpy(), group[target_column].to_numpy())
+        value = _rank_ic(group["prediction"].to_numpy(), group[target_column].to_numpy())
         if np.isfinite(value):
             records.append((str(session), value))
     if not records:
@@ -1761,14 +1201,12 @@ def _validate(
     device: torch.device,
     amp_enabled: bool,
     non_blocking: bool,
-    sector_neutral: bool = True,
 ) -> tuple[float, pd.Series]:
     model.eval()
     records: list[tuple[str, float]] = []
     if not isinstance(loader.dataset, CrossSectionalMinuteDataset):
         raise TypeError("Validation loader must contain CrossSectionalMinuteDataset.")
     dataset = loader.dataset
-    symbol_sector = np.array([SECTOR_BY_SYMBOL[symbol] for symbol in dataset.symbols])
     with torch.no_grad():
         for path, target, target_mask, indices in loader:
             path = _to_device(path, device, non_blocking)
@@ -1778,11 +1216,7 @@ def _validate(
             target_np = target.numpy()
             mask_np = target_mask.numpy()
             for batch_index, sample_index in enumerate(indices.tolist()):
-                valid = mask_np[batch_index]
-                scores = prediction[batch_index][valid]
-                if sector_neutral:
-                    scores = _sector_demean(scores, symbol_sector[valid])
-                value = _rank_ic(scores, target_np[batch_index][valid])
+                value = _rank_ic(prediction[batch_index][mask_np[batch_index]], target_np[batch_index][mask_np[batch_index]])
                 if np.isfinite(value):
                     end = dataset.sample_end_indices[int(sample_index)]
                     records.append((str(dataset.sessions[end]), value))
@@ -1803,55 +1237,14 @@ def make_prediction_frame(
     loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=0, pin_memory=non_blocking)
     records: list[dict[str, object]] = []
     model.eval()
-    has_diffusion = bool(getattr(model, "has_diffusion", False))
     with torch.no_grad():
         for path, _target, _target_mask, indices in loader:
             path = _to_device(path, device, non_blocking)
             with _autocast_context(device, amp_enabled):
-                if has_diffusion:
-                    parameters = model.forward_predictive(path)
-                    prediction = parameters["mean"]
-                else:
-                    parameters, prediction = None, model(path)
-            prediction = prediction.float().cpu().numpy()
-            extra = None
-            if parameters is not None:
-                # In the SDE model the score is also the calibrated predictive mean
-                # (standardised units).  ``predicted_*`` are the first two moments;
-                # ``pred_*`` are the exact law parameters used by the diagnostics.
-                extra = {
-                    "predicted_mean_std": prediction,
-                    "predicted_variance_std": parameters["total_variance"].float().cpu().numpy(),
-                }
-                for key, column in PREDICTIVE_PARAMETER_COLUMNS.items():
-                    if key in parameters:
-                        extra[column] = parameters[key].float().cpu().numpy()
-            records.extend(dataset.prediction_records(indices.tolist(), prediction, extra))
+                prediction = model(path)
+            prediction = prediction.cpu().numpy()
+            records.extend(dataset.prediction_records(indices.tolist(), prediction))
     return pd.DataFrame.from_records(records).sort_values(["session", "timestamp", "symbol"]).reset_index(drop=True)
-
-
-def _validation_nll(
-    model: nn.Module,
-    loader: DataLoader,
-    nll_function: "PredictiveNLL",
-    device: torch.device,
-    amp_enabled: bool,
-    non_blocking: bool,
-) -> float:
-    """Label-weighted mean predictive NLL on a frozen split (SDE model only)."""
-    model.eval()
-    total, count = 0.0, 0.0
-    with torch.no_grad():
-        for path, target, target_mask, _ in loader:
-            path = _to_device(path, device, non_blocking)
-            target = _to_device(target, device, non_blocking)
-            target_mask = _to_device(target_mask, device, non_blocking)
-            with _autocast_context(device, amp_enabled):
-                parameters = model.forward_predictive(path)
-            labels = float(target_mask.sum().item())
-            total += float(nll_function(parameters, target, target_mask).item()) * labels
-            count += labels
-    return total / count if count > 0 else float("nan")
 
 
 def _scheduled_rebalances(frame: pd.DataFrame, holding_minutes: int) -> pd.DataFrame:
@@ -2596,7 +1989,7 @@ class SeedTrainingResult:
     best_epoch: int
     best_validation_ic: float
     validation_predictions: pd.DataFrame
-    test_predictions: pd.DataFrame | None
+    test_predictions: pd.DataFrame
 
 
 def _train_one_seed(
@@ -2605,13 +1998,12 @@ def _train_one_seed(
     output_dir: Path,
     train_set: CrossSectionalMinuteDataset,
     validation_set: CrossSectionalMinuteDataset,
-    test_set: CrossSectionalMinuteDataset | None,
+    test_set: CrossSectionalMinuteDataset,
     cross_area_pca: CrossTickerAreaPCA,
     device: torch.device,
     use_amp: bool,
     use_pinned_memory: bool,
     workers: int,
-    sde_target_scale: float | None = None,
 ) -> SeedTrainingResult:
     """Train one independently initialised model and retain its validation checkpoint."""
     set_global_seed(seed, config.deterministic, config.allow_tf32)
@@ -2622,26 +2014,9 @@ def _train_one_seed(
         hidden_dim=config.affine_hidden_dim,
         num_symbols=len(train_set.symbols),
         cross_area_pca=cross_area_pca,
-        diffusion_rank=config.sde_diffusion_rank,
-        diffusion_floor=config.sde_diffusion_floor,
-        jump_mode=config.sde_jump_mode,
-        jump_initial_intensity=config.sde_jump_initial_intensity,
-        jump_initial_std=config.sde_jump_initial_std,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    sector_ids = None
-    if config.sector_neutral_objective:
-        sector_names = sorted({SECTOR_BY_SYMBOL[symbol] for symbol in train_set.symbols})
-        sector_ids = torch.tensor([sector_names.index(SECTOR_BY_SYMBOL[symbol]) for symbol in train_set.symbols])
-    loss_function = CrossSectionalRankLoss(config.min_labelled_symbols, sector_ids).to(device)
-    nll_function: PredictiveNLL | None = None
-    if model.has_diffusion:
-        if sde_target_scale is None:
-            raise ValueError("The SDE model needs a train-only target scale.")
-        nll_function = PredictiveNLL(
-            sde_target_scale, config.sde_target_clip, config.sde_jump_mode, config.sde_jump_max_count
-        ).to(device)
-    best_validation_nll = float("nan")
+    loss_function = CrossSectionalRankLoss(config.min_labelled_symbols).to(device)
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         grad_scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     else:  # pragma: no cover - compatibility with older PyTorch releases
@@ -2675,30 +2050,20 @@ def _train_one_seed(
     for epoch in range(1, config.max_epochs + 1):
         model.train()
         losses: list[float] = []
-        nll_losses: list[float] = []
         for path, target, target_mask, _ in train_loader:
             path = _to_device(path, device, use_pinned_memory)
             target = _to_device(target, device, use_pinned_memory)
             target_mask = _to_device(target_mask, device, use_pinned_memory)
             optimizer.zero_grad(set_to_none=True)
             with _autocast_context(device, use_amp):
-                if nll_function is not None:
-                    parameters = model.forward_predictive(path)
-                    prediction = parameters["mean"]
-                    rank_loss = loss_function(prediction, target, target_mask)
-                    nll_loss = nll_function(parameters, target, target_mask)
-                    loss = rank_loss + config.sde_nll_weight * nll_loss
-                    nll_losses.append(float(nll_loss.item()))
-                else:
-                    prediction = model(path)
-                    rank_loss = loss_function(prediction, target, target_mask)
-                    loss = rank_loss
+                prediction = model(path)
+                loss = loss_function(prediction, target, target_mask)
             grad_scaler.scale(loss).backward()
             grad_scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             grad_scaler.step(optimizer)
             grad_scaler.update()
-            losses.append(float(rank_loss.item()))
+            losses.append(float(loss.item()))
 
         validation_ic, validation_daily_ic = _validate(
             model,
@@ -2706,29 +2071,13 @@ def _train_one_seed(
             device,
             use_amp,
             use_pinned_memory,
-            sector_neutral=config.sector_neutral_objective,
         )
-        validation_nll = float("nan")
-        sde_message = ""
-        if nll_function is not None:
-            validation_nll = _validation_nll(
-                model, validation_loader, nll_function, device, use_amp, use_pinned_memory
-            )
-            sde_message = (
-                f" | train NLL {np.mean(nll_losses):.5f} | validation NLL {validation_nll:.5f}"
-                f" | obs std {float(torch.exp(model.log_observation_std).item()):.4f}"
-            )
-            if model.jump_mode == "student_t":
-                sde_message += f" | dof {2.0 + float(torch.exp(model.log_dof_minus_two).item()):.2f}"
         print(
             f"Seed {seed} | Epoch {epoch:03d} | train normal-score rank loss {np.mean(losses):.5f} | "
-            f"validation sector-neutral Rank IC {validation_ic:.5f}{sde_message}"
+            f"validation sector-neutral Rank IC {validation_ic:.5f}"
         )
-        # Checkpoints are still selected on validation Rank IC, so the SDE and
-        # deterministic (diffusion_rank=0) runs are selected by the same rule.
         if epoch > config.warmup_epochs and not np.isnan(validation_ic) and validation_ic > best_validation_ic:
             best_validation_ic = validation_ic
-            best_validation_nll = validation_nll
             best_epoch = epoch
             stale_epochs = 0
             torch.save(model.state_dict(), best_path)
@@ -2756,12 +2105,9 @@ def _train_one_seed(
         raise RuntimeError(f"Seed {seed} saved no validation checkpoint; inspect validation Rank IC and training data.")
     model.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
     validation_predictions = make_prediction_frame(model, validation_set, device, use_amp, use_pinned_memory)
-    test_predictions = (
-        make_prediction_frame(model, test_set, device, use_amp, use_pinned_memory) if test_set is not None else None
-    )
+    test_predictions = make_prediction_frame(model, test_set, device, use_amp, use_pinned_memory)
     validation_predictions.to_parquet(output_dir / f"seed_{seed}_validation_predictions.parquet", index=False)
-    if test_predictions is not None:
-        test_predictions.to_parquet(output_dir / f"seed_{seed}_oos_predictions.parquet", index=False)
+    test_predictions.to_parquet(output_dir / f"seed_{seed}_oos_predictions.parquet", index=False)
     (output_dir / f"seed_{seed}_training_summary.json").write_text(
         json.dumps(
             {
@@ -2769,9 +2115,6 @@ def _train_one_seed(
                 "checkpoint": best_path.name,
                 "best_epoch": best_epoch,
                 "best_validation_sector_neutral_rank_ic": best_validation_ic,
-                "diffusion_rank": config.sde_diffusion_rank,
-                "jump_mode": config.sde_jump_mode,
-                "best_validation_nll": best_validation_nll,
             },
             indent=2,
         ),
@@ -2817,30 +2160,6 @@ def average_seed_prediction_frames(frames: list[pd.DataFrame], seeds: tuple[int,
         result[column] = _sector_standardised_scores(candidate).to_numpy()
         score_columns.append(column)
     result["prediction"] = result[score_columns].mean(axis=1)
-    distribution_columns = {"predicted_mean_std", "predicted_variance_std"}
-    if all(distribution_columns.issubset(frame.columns) for frame in frames):
-        # Equal-weight Gaussian mixture of the seeds' predictive laws:
-        # mean = avg(mu_k); variance = avg(var_k) + avg(mu_k^2) - mean^2.
-        means = np.column_stack(
-            [frame.sort_values(keys)["predicted_mean_std"].to_numpy(dtype=float) for frame in frames]
-        )
-        variances = np.column_stack(
-            [frame.sort_values(keys)["predicted_variance_std"].to_numpy(dtype=float) for frame in frames]
-        )
-        mixture_mean = means.mean(axis=1)
-        result["predicted_mean_std"] = mixture_mean
-        result["predicted_variance_std"] = variances.mean(axis=1) + (means**2).mean(axis=1) - mixture_mean**2
-        result["predicted_epistemic_variance_std"] = means.var(axis=1)
-        # Keep each seed's exact law parameters so diagnostics can evaluate the
-        # equal-weight mixture density, not only its first two moments.
-        for seed, frame in zip(seeds, frames, strict=True):
-            ordered = frame.sort_values(keys)
-            for column in PREDICTIVE_PARAMETER_COLUMNS.values():
-                if column in ordered.columns:
-                    result[f"{column}__seed{seed}"] = ordered[column].to_numpy(dtype=float)
-        for column in PREDICTIVE_PARAMETER_COLUMNS.values():
-            if column in result.columns:
-                result = result.drop(columns=column)
     return result
 
 
@@ -2875,41 +2194,23 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
         f"{len(relative_return_spec['sector_members'])} fixed sectors."
     )
     write_missing_bar_diagnostics(features, output_dir)
-    del bars
     train_raw, validation_raw, test_raw = split_by_session(features, config.train_ratio, config.val_ratio)
-    # Free each intermediate frame as soon as it is no longer needed: for a
-    # 100-name universe the feature table alone is several GB.
-    del features
     scaler = fit_feature_scaler(train_raw)
     (output_dir / "feature_scaler.json").write_text(json.dumps(scaler, indent=2), encoding="utf-8")
     train = apply_feature_scaler(train_raw, scaler)
-    del train_raw
     validation = apply_feature_scaler(validation_raw, scaler)
-    del validation_raw
-    test = apply_feature_scaler(test_raw, scaler) if config.evaluate_test else None
-    del test_raw
+    test = apply_feature_scaler(test_raw, scaler)
 
     train_set = CrossSectionalMinuteDataset(
         train, config.window_minutes, config.min_labelled_symbols, config.train_sample_stride_minutes
     )
-    del train
     validation_set = CrossSectionalMinuteDataset(
         validation, config.window_minutes, config.min_labelled_symbols, config.evaluation_sample_stride_minutes
     )
-    del validation
-    test_set = (
-        CrossSectionalMinuteDataset(
-            test, config.window_minutes, config.min_labelled_symbols, config.evaluation_sample_stride_minutes
-        )
-        if config.evaluate_test
-        else None
+    test_set = CrossSectionalMinuteDataset(
+        test, config.window_minutes, config.min_labelled_symbols, config.evaluation_sample_stride_minutes
     )
-    del test
-    if not config.evaluate_test:
-        print("evaluate_test=False: the test split is not scored and no OOS evaluation is run.")
-    if not (train_set.symbols == validation_set.symbols) or (
-        test_set is not None and train_set.symbols != test_set.symbols
-    ):
+    if not (train_set.symbols == validation_set.symbols == test_set.symbols):
         raise ValueError("Train, validation, and test must contain the same ordered ticker universe.")
     target_calibration_spec = {
         "fit_split": "train_only",
@@ -2947,8 +2248,6 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
     )
     pca_summary = {
         "fit_split": "train_only",
-        "fit_window_count": int(cross_area_pca.fit_window_count),
-        "fit_window_subsampled": bool(cross_area_pca.fit_window_subsampled),
         "raw_area_features": cross_area_spec["total_cross_ticker_area_count"],
         "pca_input_price_price_features": cross_area_spec["price_price_count"],
         "retained_price_price_components": int(config.price_price_pca_components),
@@ -2969,8 +2268,7 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
     }
     (output_dir / "cross_ticker_area_pca.json").write_text(json.dumps(pca_summary, indent=2), encoding="utf-8")
     print(
-        f"Dataset: {len(train_set):,} train / {len(validation_set):,} validation / "
-        f"{(len(test_set) if test_set is not None else 0):,} test windows (scored={test_set is not None}); "
+        f"Dataset: {len(train_set):,} train / {len(validation_set):,} validation / {len(test_set):,} test windows; "
         f"{len(train_set.symbols)} common symbols; train stride={config.train_sample_stride_minutes} minutes, "
         f"validation/test stride={config.evaluation_sample_stride_minutes} minutes; "
         f"selective signature={SELECTIVE_SIGNATURE_DIM} + state context={STATE_CONTEXT_DIM} + "
@@ -2981,47 +2279,6 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
         f"{cross_area_spec['price_volume_count']} price-volume→{config.price_volume_pca_components} PCA components "
         f"(train explained variance={pca_summary['price_volume_cumulative_explained_variance_ratio']:.1%})."
     )
-
-    sde_target_scale: float | None = None
-    sde_baseline_variance: dict[str, float] | None = None
-    if config.sde_diffusion_rank > 0:
-        if config.sde_nll_weight < 0.0:
-            raise ValueError("sde_nll_weight must be non-negative.")
-        if config.sde_jump_mode not in JUMP_MODES:
-            raise ValueError(f"sde_jump_mode must be one of {JUMP_MODES}.")
-        sde_target_scale = fit_sde_target_scale(train_set)
-        sde_baseline_variance = per_symbol_baseline_variance(train_set, sde_target_scale, config.sde_target_clip)
-        sde_spec = {
-            "model": "linear latent SDE dZ = (A(c)Z + b(c))dt + G(c)dW, exact Gaussian endpoint via matrix exponentials",
-            "covariance_method": "Van Loan block matrix exponential",
-            "diffusion_rank": config.sde_diffusion_rank,
-            "diffusion_floor": config.sde_diffusion_floor,
-            "observation_noise": "single global homoskedastic parameter",
-            "loss": "rank loss + sde_nll_weight * Gaussian NLL of standardised sector-excess return",
-            "sde_nll_weight": config.sde_nll_weight,
-            "target_scale_fit_split": "train_only",
-            "target_scale_method": "1.4826 * MAD of sector-excess forward return",
-            "target_scale": sde_target_scale,
-            "target_clip_in_scale_units": config.sde_target_clip,
-            "baseline_variance_by_symbol": sde_baseline_variance,
-            "checkpoint_selection": "validation Rank IC (same rule as the deterministic model)",
-            "jump_mode": config.sde_jump_mode,
-            "jump_specification": {
-                "none": "Gaussian predictive law",
-                "merton": "y = w'Z_1 + q + eps + sum_{i<=N} xi_i, N ~ Poisson(lambda(c)), xi ~ N(0, s_J(c)^2); "
-                "exact Poisson-mixture likelihood truncated at jump_max_count",
-                "student_t": "Student-t with the Gaussian variance and a global learned dof",
-            }[config.sde_jump_mode],
-            "jump_max_count": config.sde_jump_max_count,
-            "jump_initial_intensity": config.sde_jump_initial_intensity,
-            "jump_initial_std": config.sde_jump_initial_std,
-        }
-        (output_dir / "sde_model_spec.json").write_text(json.dumps(sde_spec, indent=2), encoding="utf-8")
-        print(
-            f"Linear latent SDE: rank={config.sde_diffusion_rank}, jumps={config.sde_jump_mode}, "
-            f"NLL weight={config.sde_nll_weight:g}, "
-            f"train target scale={sde_target_scale:.3e}"
-        )
 
     training_seeds = tuple(dict.fromkeys(config.ensemble_seeds))
     if not training_seeds:
@@ -3048,20 +2305,17 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
             use_amp,
             use_pinned_memory,
             workers,
-            sde_target_scale,
         )
         for seed in training_seeds
     ]
     validation_predictions = average_seed_prediction_frames(
         [result.validation_predictions for result in seed_results], training_seeds
     )
+    test_predictions = average_seed_prediction_frames(
+        [result.test_predictions for result in seed_results], training_seeds
+    )
     validation_predictions.to_parquet(output_dir / "ensemble_validation_predictions.parquet", index=False)
-    test_predictions: pd.DataFrame | None = None
-    if config.evaluate_test:
-        test_predictions = average_seed_prediction_frames(
-            [result.test_predictions for result in seed_results], training_seeds
-        )
-        test_predictions.to_parquet(output_dir / "ensemble_oos_predictions_uncalibrated.parquet", index=False)
+    test_predictions.to_parquet(output_dir / "ensemble_oos_predictions_uncalibrated.parquet", index=False)
     ensemble_validation_daily_ic = _daily_rank_ic_from_prediction_frame(validation_predictions)
     ensemble_validation_bootstrap = block_bootstrap_mean_ic(
         ensemble_validation_daily_ic, config.bootstrap_iterations, config.seed
@@ -3093,20 +2347,6 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
         f"95% CI [{ensemble_validation_bootstrap['ci_95_lower']:.5f}, "
         f"{ensemble_validation_bootstrap['ci_95_upper']:.5f}]"
     )
-    if not config.evaluate_test:
-        if sde_target_scale is not None:
-            write_sde_diagnostics(
-                config,
-                output_dir,
-                validation_predictions,
-                None,
-                sde_target_scale,
-                sde_baseline_variance,
-                include_oos=False,
-                include_sizing=False,
-            )
-        print("Validation-only run finished (no gate fitting, no OOS evaluation).")
-        return {"validation_only": ensemble_summary}
     score_calibration_spec = {
         "enabled": False,
         "reason": "Rank-only execution: model-score magnitude is not interpreted as an expected return.",
@@ -3232,156 +2472,7 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
     )
     for cost, values in metrics.items():
         print(f"  {cost}: {values}")
-    if sde_target_scale is not None:
-        write_sde_diagnostics(
-            config,
-            output_dir,
-            validation_predictions,
-            predictions,
-            sde_target_scale,
-            sde_baseline_variance,
-        )
     return metrics
-
-
-def uncertainty_scaled_score_frames(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Alternative execution scores built from the SDE predictive law.
-
-    ``rank_score``: the ensemble's sector-standardised score (current default).
-    ``predictive_mean``: the calibrated Gaussian mean.
-    ``mean_over_std``: predictive mean divided by predictive standard deviation, i.e.
-    a per-name forecast information ratio; within-sector z-scoring then sizes
-    low-uncertainty names more heavily.
-    ``rank_score_over_std``: the rank score divided by predictive standard deviation.
-    """
-    std = np.sqrt(np.maximum(frame["predicted_variance_std"].to_numpy(dtype=float), 1e-12))
-    variants = {
-        "rank_score": frame["prediction"].to_numpy(dtype=float),
-        "predictive_mean": frame["predicted_mean_std"].to_numpy(dtype=float),
-        "mean_over_std": frame["predicted_mean_std"].to_numpy(dtype=float) / std,
-        # Best ranking (seed-standardised ensemble score) scaled by SDE uncertainty.
-        "rank_score_over_std": frame["prediction"].to_numpy(dtype=float) / std,
-    }
-    result: dict[str, pd.DataFrame] = {}
-    for name, score in variants.items():
-        candidate = frame.copy()
-        candidate["prediction"] = score
-        result[name] = candidate
-    return result
-
-
-def write_sde_diagnostics(
-    config: RunConfig,
-    output_dir: Path,
-    validation_predictions: pd.DataFrame,
-    test_predictions: pd.DataFrame | None,
-    target_scale: float,
-    baseline_variance: dict[str, float] | None,
-    include_oos: bool = True,
-    file_suffix: str = "",
-    include_sizing: bool = True,
-) -> dict[str, object]:
-    """Distribution calibration plus an ungated mean-vs-uncertainty sizing cost curve.
-
-    ``include_oos=False`` evaluates validation only, for tuning without touching OOS.
-    """
-    splits: list[tuple[str, pd.DataFrame]] = [("validation", validation_predictions)]
-    if include_oos:
-        if test_predictions is None:
-            raise ValueError("include_oos=True needs test predictions.")
-        splits.append(("oos", test_predictions))
-    distribution = {
-        split_name: evaluate_predictive_distribution(
-            frame,
-            target_scale,
-            config.sde_target_clip,
-            baseline_variance,
-            jump_mode=config.sde_jump_mode,
-            max_jumps=config.sde_jump_max_count,
-        )
-        for split_name, frame in splits
-    }
-    (output_dir / f"sde_distribution_metrics{file_suffix}.json").write_text(
-        json.dumps(distribution, indent=2), encoding="utf-8"
-    )
-
-    if not include_sizing:
-        for split_name, _frame in splits:
-            split_distribution = distribution[split_name]
-            print(
-                f"\nSDE predictive distribution ({split_name}): NLL={split_distribution['mean_nll']:.4f}, "
-                f"coverage={split_distribution['central_interval_coverage']}"
-            )
-        return {"distribution": distribution}
-    costs = tuple(sorted(set(float(cost) for cost in config.sde_cost_curve_bps)))
-    comparison: dict[str, object] = {
-        "note": (
-            "Ungated execution for every score so the comparison isolates the score. "
-            "Validation results are the basis for choosing a score; OOS is reported once."
-        ),
-        "costs_bps": list(costs),
-    }
-    for split_name, frame in splits:
-        split_result: dict[str, object] = {}
-        print(f"  Sizing comparison on {split_name}: 3 scores x {len(costs)} costs (ungated)...", flush=True)
-        for score_name, scored in uncertainty_scaled_score_frames(frame).items():
-            daily_ic = _daily_rank_ic_from_prediction_frame(scored)
-            ungated, _ = evaluate_cost_sensitivity(
-                scored,
-                config.holding_minutes,
-                config.z_threshold,
-                session_end_policy=config.session_end_policy,
-                target_smoothing_fraction=config.target_smoothing_fraction,
-                sector_rebalance_buffer_turnover=config.sector_rebalance_buffer_turnover,
-                costs_bps=costs,
-            )
-            split_result[score_name] = {
-                "rank_ic_block_bootstrap": block_bootstrap_mean_ic(
-                    daily_ic, config.bootstrap_iterations, config.seed + 7
-                ),
-                "cost_curve": {
-                    key: {
-                        "annualized_sharpe": values.get("annualized_sharpe"),
-                        "mean_return_per_holding_period": values.get("mean_return_per_holding_period"),
-                        "mean_one_way_turnover": values.get("mean_one_way_turnover"),
-                        "max_drawdown_pct": values.get("max_drawdown_pct"),
-                    }
-                    for key, values in ungated.items()
-                    if key.endswith("bps")
-                },
-            }
-        comparison[split_name] = split_result
-    (output_dir / f"sde_uncertainty_sizing_comparison{file_suffix}.json").write_text(
-        json.dumps(comparison, indent=2), encoding="utf-8"
-    )
-    for split_name, _frame in splits:
-        split_distribution = distribution[split_name]
-        print(
-            f"\nSDE predictive distribution ({split_name}): "
-            f"NLL={split_distribution['mean_nll']:.4f}, "
-            f"coverage={split_distribution['central_interval_coverage']}, "
-            f"MZ slope={split_distribution['mincer_zarnowitz']['slope']:.3f}"
-        )
-        if "nll_improvement_vs_baseline" in split_distribution:
-            print(f"  NLL gain vs per-symbol baseline: {split_distribution['nll_improvement_vs_baseline']}")
-        if "jumps" in split_distribution:
-            jumps = split_distribution["jumps"]
-            print(
-                f"  Jumps: mean lambda {jumps['mean_intensity_per_period']:.4f} per period, "
-                f"mean jump std {jumps['mean_jump_std']:.3f}, "
-                f"jump share of variance {jumps['mean_jump_share_of_total_variance']:.2f}, "
-                f"posterior P(jump) by |y| {jumps['posterior_jump_probability_by_abs_target']}"
-            )
-    for split_name, _frame in splits:
-        for score_name, values in comparison[split_name].items():
-            curve = values["cost_curve"]
-            sharpe = {
-                key: round(float(item["annualized_sharpe"]), 2) if item["annualized_sharpe"] is not None else None
-                for key, item in curve.items()
-            }
-            ic = values["rank_ic_block_bootstrap"]["mean_daily_rank_ic"]
-            print(f"  {split_name:>10} | {score_name:<15} | daily IC {ic:.4f} | ungated Sharpe {sharpe}")
-    return {"distribution": distribution, "uncertainty_sizing": comparison}
 
 
 def parse_args() -> RunConfig:
@@ -3444,31 +2535,6 @@ def parse_args() -> RunConfig:
     parser.add_argument("--bootstrap-iterations", type=int, default=RunConfig.bootstrap_iterations)
     parser.add_argument("--seed", type=int, default=RunConfig.seed)
     parser.add_argument("--ensemble-seeds", nargs="+", type=int, default=list(RunConfig.ensemble_seeds))
-    parser.add_argument("--latent-dim", type=int, default=RunConfig.latent_dim)
-    parser.add_argument("--affine-hidden-dim", type=int, default=RunConfig.affine_hidden_dim)
-    parser.add_argument(
-        "--sde-diffusion-rank",
-        type=int,
-        default=RunConfig.sde_diffusion_rank,
-        help="Rank of the latent diffusion loading; 0 runs the deterministic affine-mean ablation.",
-    )
-    parser.add_argument("--sde-diffusion-floor", type=float, default=RunConfig.sde_diffusion_floor)
-    parser.add_argument("--sde-nll-weight", type=float, default=RunConfig.sde_nll_weight)
-    parser.add_argument("--sde-target-clip", type=float, default=RunConfig.sde_target_clip)
-    parser.add_argument(
-        "--sde-cost-curve-bps", nargs="+", type=float, default=list(RunConfig.sde_cost_curve_bps)
-    )
-    parser.add_argument("--sde-jump-mode", choices=JUMP_MODES, default=RunConfig.sde_jump_mode)
-    parser.add_argument("--sde-jump-max-count", type=int, default=RunConfig.sde_jump_max_count)
-    parser.add_argument(
-        "--sde-jump-initial-intensity", type=float, default=RunConfig.sde_jump_initial_intensity
-    )
-    parser.add_argument("--sde-jump-initial-std", type=float, default=RunConfig.sde_jump_initial_std)
-    parser.add_argument(
-        "--validation-only",
-        action="store_true",
-        help="Tuning mode: never score the test split and skip the OOS evaluation.",
-    )
     args = parser.parse_args()
     return RunConfig(
         data_dir=args.data_dir,
@@ -3495,18 +2561,6 @@ def parse_args() -> RunConfig:
         bootstrap_iterations=args.bootstrap_iterations,
         seed=args.seed,
         ensemble_seeds=tuple(args.ensemble_seeds),
-        latent_dim=args.latent_dim,
-        affine_hidden_dim=args.affine_hidden_dim,
-        sde_diffusion_rank=args.sde_diffusion_rank,
-        sde_diffusion_floor=args.sde_diffusion_floor,
-        sde_nll_weight=args.sde_nll_weight,
-        sde_target_clip=args.sde_target_clip,
-        sde_cost_curve_bps=tuple(args.sde_cost_curve_bps),
-        sde_jump_mode=args.sde_jump_mode,
-        sde_jump_max_count=args.sde_jump_max_count,
-        sde_jump_initial_intensity=args.sde_jump_initial_intensity,
-        sde_jump_initial_std=args.sde_jump_initial_std,
-        evaluate_test=not args.validation_only,
     )
 
 

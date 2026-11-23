@@ -1,4 +1,4 @@
-"""Train the signature-conditioned latent linear-SDE model from minute bars.
+"""Train the signature-conditioned affine latent mean model from minute bars.
 
 Run this file directly from the same Python environment that contains torch,
 signatory, pandas, and pyarrow.  Edit project_settings.py for settings.
@@ -16,7 +16,6 @@ from project_settings import (
     DATA_DIR,
     DETERMINISTIC,
     ENSEMBLE_SEEDS,
-    EVALUATE_TEST,
     GPU_ALLOW_TF32,
     GPU_AMP_ENABLED,
     GPU_DATA_LOADER_WORKERS,
@@ -32,15 +31,6 @@ from project_settings import (
     PROFITABILITY_GATE_COST_BPS,
     PROFITABILITY_GATE_L2,
     PROFITABILITY_GATE_MIN_PROBABILITY,
-    SDE_COST_CURVE_BPS,
-    SDE_DIFFUSION_FLOOR,
-    SDE_DIFFUSION_RANK,
-    SDE_JUMP_INITIAL_INTENSITY,
-    SDE_JUMP_INITIAL_STD,
-    SDE_JUMP_MAX_COUNT,
-    SDE_JUMP_MODE,
-    SDE_NLL_WEIGHT,
-    SDE_TARGET_CLIP,
     SEED,
     SECTOR_MEDIAN_SHRINKAGE_COUNT,
     SECTOR_REBALANCE_BUFFER_TURNOVER,
@@ -102,16 +92,6 @@ def main() -> None:
             deterministic=DETERMINISTIC,
             seed=SEED,
             ensemble_seeds=ENSEMBLE_SEEDS,
-            sde_diffusion_rank=SDE_DIFFUSION_RANK,
-            sde_diffusion_floor=SDE_DIFFUSION_FLOOR,
-            sde_nll_weight=SDE_NLL_WEIGHT,
-            sde_target_clip=SDE_TARGET_CLIP,
-            sde_cost_curve_bps=tuple(SDE_COST_CURVE_BPS),
-            sde_jump_mode=SDE_JUMP_MODE,
-            sde_jump_max_count=SDE_JUMP_MAX_COUNT,
-            sde_jump_initial_intensity=SDE_JUMP_INITIAL_INTENSITY,
-            sde_jump_initial_std=SDE_JUMP_INITIAL_STD,
-            evaluate_test=EVALUATE_TEST,
         )
     )
 
