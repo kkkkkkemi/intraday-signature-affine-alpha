@@ -20,6 +20,7 @@ import json
 import math
 import os
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -52,7 +53,41 @@ FEATURE_COLUMNS = (
     "clv",
     "has_trade",
     "staleness_minutes",
+    # --- v2 context features (appended; earlier channel indices are unchanged) ---
+    "volume_surprise",
+    "cumulative_volume_surprise",
+    "log_transactions",
+    "log_avg_trade_size",
+    "relative_return_since_open",
+    "overnight_gap_relative",
+    "prior_day_relative_return",
+    "prior_day_realized_vol",
+    "intraday_range_position",
+    "session_vwap_deviation",
+    "market_return_5m",
+    "market_return_15m",
+    "market_return_30m",
+    "sector_etf_relative_return_5m",
+    "sector_etf_relative_return_15m",
+    "sector_etf_relative_return_30m",
 )
+# Endpoint values of the v2 features, plus window means of the per-minute flow
+# features, enter the model as extra context (the signature path is unchanged).
+EXTRA_CONTEXT_ENDPOINT_COLUMNS = FEATURE_COLUMNS[12:]
+EXTRA_CONTEXT_MEAN_COLUMNS = ("volume_surprise", "log_transactions", "log_avg_trade_size")
+# Named groups of v2 features that a run can switch off (set to zero) for ablations.
+FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
+    # Constant within a day: together they can act as a stock-day fingerprint.
+    "day_constant": ("overnight_gap_relative", "prior_day_relative_return", "prior_day_realized_vol"),
+    "volume_flow": ("volume_surprise", "cumulative_volume_surprise", "log_transactions", "log_avg_trade_size"),
+    "session": ("relative_return_since_open", "intraday_range_position", "session_vwap_deviation"),
+    "etf": (
+        "market_return_5m", "market_return_15m", "market_return_30m",
+        "sector_etf_relative_return_5m", "sector_etf_relative_return_15m", "sector_etf_relative_return_30m",
+    ),
+}
+VOLUME_SURPRISE_LOOKBACK_SESSIONS = 20
+VOLUME_SURPRISE_MIN_SESSIONS = 5
 TIME_FEATURE_INDEX = FEATURE_COLUMNS.index("t_dim")
 RELATIVE_PRICE_FEATURE_INDEX = FEATURE_COLUMNS.index("relative_cum_ret")
 VOLUME_FEATURE_INDEX = FEATURE_COLUMNS.index("log_volume")
@@ -100,12 +135,15 @@ SIGNATURE_PATH_CHANNELS = 1 + 2 * len(SIGNATURE_CONTINUOUS_COLUMNS)
 SELECTIVE_SIGNATURE_DIM = SIGNATURE_PATH_CHANNELS + SIGNATURE_PATH_CHANNELS * (SIGNATURE_PATH_CHANNELS - 1) // 2
 STATE_CONTEXT_DIM = 7
 DIRECTIONAL_MULTISCALE_CONTEXT_DIM = len(DIRECTIONAL_MULTISCALE_COLUMNS)
+EXTRA_CONTEXT_ENDPOINT_INDICES = tuple(FEATURE_COLUMNS.index(column) for column in EXTRA_CONTEXT_ENDPOINT_COLUMNS)
+EXTRA_CONTEXT_MEAN_INDICES = tuple(FEATURE_COLUMNS.index(column) for column in EXTRA_CONTEXT_MEAN_COLUMNS)
+EXTRA_CONTEXT_DIM = len(EXTRA_CONTEXT_ENDPOINT_INDICES) + len(EXTRA_CONTEXT_MEAN_INDICES)
 CLV_DENOMINATOR_EPS = 1e-12
 RAW_COLUMNS = {"timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap"}
 # Fixed GICS sectors for every supported research universe (see universe.py).
 # They are part of the feature specification rather than a live vendor lookup.
 # V and MA are Financials under the March 2023 GICS reclassification.
-from universe import SECTOR_BY_SYMBOL  # noqa: E402
+from universe import ETF_TICKERS, MARKET_ETF, SECTOR_BY_SYMBOL, SECTOR_ETF  # noqa: E402
 SECTOR_MEDIAN_SHRINKAGE_COUNT = 5.0
 # Cross-ticker PCA memory bound (elements of the windows x area-columns matrix).
 PCA_MAX_MATRIX_ELEMENTS = 150_000_000
@@ -185,6 +223,18 @@ class RunConfig:
     # training objective and checkpoint selection measure the within-sector
     # ranking that the ensemble and sector-neutral portfolio use.
     sector_neutral_objective: bool = True
+    # Regularisation and ablation switches.
+    context_dropout: float = 0.0
+    attention_dropout: float = 0.1
+    drop_feature_groups: tuple[str, ...] = ()
+    # v2 inputs and architecture.
+    use_etf_context: bool = True
+    stock_embedding_dim: int = 8
+    cross_attention_layers: int = 1
+    attention_dim: int = 64
+    attention_heads: int = 4
+    # Training-set windows scored each epoch to compare train vs validation IC.
+    train_ic_monitor_windows: int = 2000
 
 
 def set_global_seed(seed: int, deterministic: bool, allow_tf32: bool) -> None:
@@ -238,12 +288,14 @@ def load_minute_bars(data_dir: str | Path, symbols: Iterable[str] | None = None)
         missing = RAW_COLUMNS.difference(frame.columns)
         if missing:
             raise ValueError(f"{file.name} is missing required columns: {sorted(missing)}")
-        frames.append(frame[list(RAW_COLUMNS)].copy())
+        if "transactions" not in frame.columns:
+            frame["transactions"] = np.nan
+        frames.append(frame[[*sorted(RAW_COLUMNS), "transactions"]].copy())
 
     bars = pd.concat(frames, ignore_index=True)
     bars["symbol"] = bars["symbol"].astype(str).str.upper()
     bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
-    for column in ("open", "high", "low", "close", "volume", "vwap"):
+    for column in ("open", "high", "low", "close", "volume", "vwap", "transactions"):
         bars[column] = pd.to_numeric(bars[column], errors="coerce")
     bars = bars.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
     bars = bars[(bars[["open", "high", "low", "close"]] > 0).all(axis=1) & (bars["volume"] >= 0)]
@@ -273,6 +325,8 @@ def _expand_to_session_grid(bars: pd.DataFrame) -> pd.DataFrame:
     symbols = sorted(bars["symbol"].unique())
     pieces: list[pd.DataFrame] = []
     observed_columns = ["timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap"]
+    if "transactions" in bars.columns:
+        observed_columns.append("transactions")
 
     for session, observed in bars.groupby("session", sort=True):
         observed = observed[observed_columns].drop_duplicates(["symbol", "timestamp"], keep="last").copy()
@@ -308,6 +362,10 @@ def _expand_to_session_grid(bars: pd.DataFrame) -> pd.DataFrame:
         for column in ("open", "high", "low"):
             dense[column] = dense[column].where(dense["has_trade"].eq(1.0), dense["close"])
         dense["volume"] = dense["volume"].where(dense["has_trade"].eq(1.0), 0.0).fillna(0.0)
+        if "transactions" in dense.columns:
+            dense["transactions"] = dense["transactions"].where(dense["has_trade"].eq(1.0), 0.0).fillna(0.0)
+        else:
+            dense["transactions"] = np.nan
         dense["vwap"] = dense["vwap"].where(
             dense["has_trade"].eq(1.0) & dense["vwap"].gt(0), dense["close"]
         )
@@ -347,6 +405,85 @@ def sector_relative_return_feature_spec(
     }
 
 
+def _add_v2_context_features(frame: pd.DataFrame, etf_bars: pd.DataFrame | None) -> pd.DataFrame:
+    """Causal flow, session and ETF context features (all known at the close of minute t)."""
+    real = frame["has_trade"].eq(1.0)
+    session_keys = [frame["symbol"], frame["session"]]
+
+    # Volume relative to the same minute over the previous sessions.
+    frame["volume_surprise"] = frame["log_volume"] - _historical_same_minute_mean(frame, "log_volume")
+    frame["_log_cumulative_volume"] = np.log1p(frame.groupby(session_keys, sort=False)["volume"].cumsum())
+    frame["cumulative_volume_surprise"] = frame["_log_cumulative_volume"] - _historical_same_minute_mean(
+        frame, "_log_cumulative_volume"
+    )
+
+    # Trade count and average trade size (zero on missing bars).
+    transactions = frame["transactions"].fillna(0.0) if "transactions" in frame.columns else pd.Series(0.0, index=frame.index)
+    frame["log_transactions"] = np.log1p(transactions.where(real, 0.0))
+    frame["log_avg_trade_size"] = np.where(
+        real & transactions.gt(0), frame["log_volume"] - np.log1p(transactions), 0.0
+    )
+
+    # Session context.
+    frame["relative_return_since_open"] = frame["relative_cum_ret"]
+    by_session = frame[real].groupby(["symbol", "session"], sort=True)
+    daily = pd.DataFrame(
+        {
+            "first_open": by_session["raw_open"].first(),
+            "first_time": by_session["timestamp"].first(),
+            "last_close": by_session["raw_close"].last(),
+            "day_relative_return": frame.groupby(["symbol", "session"], sort=True)["relative_cum_ret"].last(),
+            "day_realized_vol": by_session["log_return_1m"].std(ddof=0),
+        }
+    ).reset_index().sort_values(["symbol", "session"])
+    previous = daily.groupby("symbol", sort=False)[["last_close", "day_relative_return", "day_realized_vol"]].shift(1)
+    daily["overnight_gap"] = np.log(daily["first_open"] / previous["last_close"])
+    daily["prior_day_relative_return"] = previous["day_relative_return"]
+    daily["prior_day_realized_vol"] = previous["day_realized_vol"]
+    daily["sector"] = daily["symbol"].map(SECTOR_BY_SYMBOL)
+    sector_gap = daily.groupby(["session", "sector"])["overnight_gap"].transform("median")
+    universe_gap = daily.groupby("session")["overnight_gap"].transform("median")
+    daily["overnight_gap_relative"] = daily["overnight_gap"] - sector_gap.fillna(universe_gap)
+    merged = frame[["symbol", "session"]].merge(
+        daily[["symbol", "session", "first_time", "overnight_gap_relative", "prior_day_relative_return", "prior_day_realized_vol"]],
+        on=["symbol", "session"],
+        how="left",
+    )
+    merged.index = frame.index
+    known_gap = frame["timestamp"].ge(merged["first_time"])
+    frame["overnight_gap_relative"] = merged["overnight_gap_relative"].where(known_gap, 0.0)
+    frame["prior_day_relative_return"] = merged["prior_day_relative_return"]
+    frame["prior_day_realized_vol"] = merged["prior_day_realized_vol"]
+
+    running_high = frame.groupby(session_keys, sort=False)["close"].cummax()
+    running_low = frame.groupby(session_keys, sort=False)["close"].cummin()
+    span = running_high - running_low
+    frame["intraday_range_position"] = np.where(span > 1e-12, (frame["close"] - running_low) / span.where(span > 1e-12, 1.0), 0.5)
+    dollar_volume = (frame["vwap"] * frame["volume"]).groupby(session_keys, sort=False).cumsum()
+    cumulative_volume = frame.groupby(session_keys, sort=False)["volume"].cumsum()
+    session_vwap = dollar_volume / cumulative_volume.where(cumulative_volume > 0)
+    frame["session_vwap_deviation"] = (frame["close"] / session_vwap - 1.0).fillna(0.0)
+
+    etf_features = _etf_context_features(frame, etf_bars)
+    for column in etf_features.columns:
+        frame[column] = etf_features[column].to_numpy()
+    return frame.drop(columns=["_log_cumulative_volume"])
+
+
+def apply_feature_drops(frame: pd.DataFrame, groups: Iterable[str]) -> pd.DataFrame:
+    """Zero out named v2 feature groups (dimensions are kept, so runs stay comparable)."""
+    groups = tuple(groups)
+    unknown = sorted(set(groups).difference(FEATURE_GROUPS))
+    if unknown:
+        raise ValueError(f"Unknown feature group(s) {unknown}; choose from {sorted(FEATURE_GROUPS)}.")
+    for group in groups:
+        for column in FEATURE_GROUPS[group]:
+            frame[column] = 0.0
+    if groups:
+        print(f"Feature groups switched off: {list(groups)}")
+    return frame
+
+
 def drop_incomplete_sessions(bars: pd.DataFrame) -> pd.DataFrame:
     """Remove sessions whose data stop before the market closed.
 
@@ -370,10 +507,70 @@ def drop_incomplete_sessions(bars: pd.DataFrame) -> pd.DataFrame:
     return bars[~bars["session"].isin(dropped)]
 
 
+def load_etf_bars(data_dir: str | Path) -> pd.DataFrame | None:
+    """Minute bars of the context ETFs stored in <data_dir>/etf (None if absent)."""
+    etf_dir = Path(data_dir) / "etf"
+    files = {path.stem.upper(): path for path in etf_dir.glob("*.parquet")} if etf_dir.exists() else {}
+    if not files:
+        return None
+    missing = sorted(set(ETF_TICKERS).difference(files))
+    if missing:
+        raise FileNotFoundError(f"Context ETFs missing from {etf_dir}: {missing}. Run download_data.py.")
+    frames = []
+    for ticker in ETF_TICKERS:
+        frame = pd.read_parquet(files[ticker], columns=["timestamp", "close"])
+        frame["symbol"] = ticker
+        frames.append(frame)
+    etf = pd.concat(frames, ignore_index=True)
+    etf["timestamp"] = pd.to_datetime(etf["timestamp"], utc=True)
+    etf = etf[etf["close"] > 0]
+    return etf.loc[_is_regular_session(etf["timestamp"])].reset_index(drop=True)
+
+
+def _historical_same_minute_mean(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Mean of ``column`` at the same session minute over the previous sessions (causal)."""
+    keys = [frame["symbol"], frame["minute_of_session"]]
+    shifted = frame.groupby(keys, sort=False)[column].shift(1)
+    rolled = (
+        shifted.groupby(keys, sort=False)
+        .rolling(VOLUME_SURPRISE_LOOKBACK_SESSIONS, min_periods=VOLUME_SURPRISE_MIN_SESSIONS)
+        .mean()
+    )
+    return rolled.reset_index(level=[0, 1], drop=True).reindex(frame.index)
+
+
+def _etf_context_features(frame: pd.DataFrame, etf_bars: pd.DataFrame | None) -> pd.DataFrame:
+    """SPY and own-sector ETF log returns over 5/15/30 minutes, on the stock grid."""
+    columns = [f"market_return_{h}m" for h in (5, 15, 30)] + [
+        f"sector_etf_relative_return_{h}m" for h in (5, 15, 30)
+    ]
+    if etf_bars is None:
+        return pd.DataFrame(0.0, index=frame.index, columns=columns)
+    grid = frame[["session", "timestamp"]].drop_duplicates().sort_values(["session", "timestamp"])
+    closes = etf_bars.pivot_table(index="timestamp", columns="symbol", values="close", aggfunc="last")
+    closes = closes.reindex(grid["timestamp"].to_numpy())
+    closes.index = pd.MultiIndex.from_arrays([grid["session"].to_numpy(), grid["timestamp"].to_numpy()], names=["session", "timestamp"])
+    log_close = np.log(closes).groupby(level="session").ffill()
+    returns = {h: log_close.groupby(level="session").diff(h) for h in (5, 15, 30)}
+    keyed = frame.set_index(["session", "timestamp"]).index
+    sector_etf = frame["sector"].map(SECTOR_ETF)
+    out = pd.DataFrame(index=frame.index)
+    for h in (5, 15, 30):
+        market = returns[h][MARKET_ETF].reindex(keyed).to_numpy()
+        out[f"market_return_{h}m"] = market
+        sector_values = np.full(len(frame), np.nan)
+        for etf in sector_etf.dropna().unique():
+            members = (sector_etf == etf).to_numpy()
+            sector_values[members] = returns[h][etf].reindex(keyed[members]).to_numpy()
+        out[f"sector_etf_relative_return_{h}m"] = sector_values - market
+    return out
+
+
 def engineer_minute_features(
     bars: pd.DataFrame,
     holding_minutes: int,
     sector_median_shrinkage_count: float = SECTOR_MEDIAN_SHRINKAGE_COUNT,
+    etf_bars: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Create causal OHLCV features and labels valid only at real trade bars."""
     prepared = bars.copy()
@@ -468,6 +665,7 @@ def engineer_minute_features(
     frame["rank_target_return"] = (frame["target_return"] - forward_sector_mean).where(
         forward_sector_count.ge(2)
     )
+    frame = _add_v2_context_features(frame, etf_bars)
     frame["input_available"] = frame[list(FEATURE_COLUMNS)].notna().all(axis=1)
     if frame["symbol"].nunique() > FLOAT32_FEATURE_SYMBOL_THRESHOLD:
         # Model inputs are float32 anyway; labels and prices stay float64.
@@ -709,6 +907,15 @@ class CrossSectionalMinuteDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.sample_end_indices)
+
+    def subset(self, max_windows: int) -> "CrossSectionalMinuteDataset":
+        """Shallow copy restricted to evenly spaced windows (shares the arrays)."""
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        if len(self.sample_end_indices) > max_windows:
+            positions = np.unique(np.linspace(0, len(self.sample_end_indices) - 1, max_windows).astype(np.int64))
+            clone.sample_end_indices = self.sample_end_indices[positions]
+        return clone
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         end = self.sample_end_indices[index]
@@ -956,8 +1163,20 @@ class SignatureConditionedAffineMeanModel(nn.Module):
         jump_mode: str = "none",
         jump_initial_intensity: float = 0.05,
         jump_initial_std: float = 2.0,
+        stock_embedding_dim: int = 0,
+        cross_attention_layers: int = 0,
+        attention_dim: int = 64,
+        attention_heads: int = 4,
+        attention_dropout: float = 0.1,
+        context_dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if not 0.0 <= context_dropout < 1.0:
+            raise ValueError("context_dropout must lie in [0, 1).")
+        if stock_embedding_dim < 0 or cross_attention_layers < 0:
+            raise ValueError("stock_embedding_dim and cross_attention_layers must be non-negative.")
+        if cross_attention_layers > 0 and attention_dim % attention_heads != 0:
+            raise ValueError("attention_dim must be divisible by attention_heads.")
         if jump_mode not in JUMP_MODES:
             raise ValueError(f"jump_mode must be one of {JUMP_MODES}.")
         if jump_mode != "none" and diffusion_rank <= 0:
@@ -1006,13 +1225,49 @@ class SignatureConditionedAffineMeanModel(nn.Module):
             raise ValueError("Cross-ticker PCA components do not match the price-volume area dimension.")
         self.price_price_pca_components = cross_area_pca.price_price_components.shape[0]
         self.price_volume_pca_components = cross_area_pca.price_volume_components.shape[0]
-        self.context_dim = (
+        self.base_context_dim = (
             self.signature_dim
             + self.state_context_dim
             + self.directional_multiscale_context_dim
+            + EXTRA_CONTEXT_DIM
             + self.price_price_pca_components
             + self.price_volume_pca_components
         )
+        # Optional per-stock identity and cross-stock interaction.  Both only add to
+        # the context that conditions A(c), b(c), G(c) and the jump head.
+        self.stock_embedding_dim = int(stock_embedding_dim)
+        self.cross_attention_layers = int(cross_attention_layers)
+        self.stock_embedding = (
+            nn.Embedding(num_symbols, self.stock_embedding_dim) if self.stock_embedding_dim > 0 else None
+        )
+        if self.stock_embedding is not None:
+            nn.init.normal_(self.stock_embedding.weight, std=0.1)
+        if self.cross_attention_layers > 0:
+            self.attention_input = nn.Sequential(
+                nn.LayerNorm(self.base_context_dim + self.stock_embedding_dim),
+                nn.Linear(self.base_context_dim + self.stock_embedding_dim, attention_dim),
+            )
+            self.cross_attention = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=attention_dim,
+                    nhead=attention_heads,
+                    dim_feedforward=2 * attention_dim,
+                    dropout=attention_dropout,
+                    batch_first=True,
+                    norm_first=True,
+                ),
+                num_layers=self.cross_attention_layers,
+                enable_nested_tensor=False,
+            )
+            self.attention_output_dim = attention_dim
+        else:
+            self.attention_input = None
+            self.cross_attention = None
+            self.attention_output_dim = 0
+        self.context_dim = self.base_context_dim + self.stock_embedding_dim + self.attention_output_dim
+        # Dropout on the full conditioning context (training only); regularises the
+        # drift, diffusion and jump heads together without changing their layout.
+        self.context_dropout = nn.Dropout(context_dropout)
         pair_i, pair_j = torch.triu_indices(num_symbols, num_symbols, offset=1)
         ordered_i, ordered_j = torch.where(~torch.eye(num_symbols, dtype=torch.bool))
         signature_i, signature_j = torch.triu_indices(
@@ -1126,6 +1381,29 @@ class SignatureConditionedAffineMeanModel(nn.Module):
             ],
             dim=1,
         )
+
+    @staticmethod
+    def _extra_context(path: torch.Tensor) -> torch.Tensor:
+        """v2 features: endpoint values plus window means of the flow features."""
+        return torch.cat(
+            [
+                path[:, -1, list(EXTRA_CONTEXT_ENDPOINT_INDICES)],
+                path[:, :, list(EXTRA_CONTEXT_MEAN_INDICES)].mean(dim=1),
+            ],
+            dim=1,
+        )
+
+    def _augment_context(self, context: torch.Tensor, batch_size: int, num_symbols: int) -> torch.Tensor:
+        """Append the stock embedding and the cross-stock attention output."""
+        pieces = [context]
+        if self.stock_embedding is not None:
+            identity = self.stock_embedding.weight.unsqueeze(0).expand(batch_size, -1, -1)
+            pieces.append(identity.reshape(batch_size * num_symbols, -1))
+        if self.cross_attention is not None:
+            tokens = torch.cat(pieces, dim=1).view(batch_size, num_symbols, -1)
+            attended = self.cross_attention(self.attention_input(tokens))
+            pieces.append(attended.reshape(batch_size * num_symbols, -1))
+        return torch.cat(pieces, dim=1)
 
     @staticmethod
     def _directional_multiscale_context(path: torch.Tensor) -> torch.Tensor:
@@ -1294,6 +1572,7 @@ class SignatureConditionedAffineMeanModel(nn.Module):
                 signature,
                 state_context,
                 directional_multiscale_context,
+                self._extra_context(individual_path),
                 cross_context.unsqueeze(1)
                 .expand(-1, num_symbols, -1)
                 .reshape(
@@ -1303,6 +1582,7 @@ class SignatureConditionedAffineMeanModel(nn.Module):
             ],
             dim=1,
         )
+        context = self.context_dropout(self._augment_context(context, batch_size, num_symbols))
         initial_state = self._initial_state(individual_path)
         drift_matrix, drift_intercept = self._coefficients(context)
 
@@ -2599,6 +2879,13 @@ class SeedTrainingResult:
     test_predictions: pd.DataFrame | None
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(int(round(seconds)), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:d}:{secs:02d}"
+
+
 def _train_one_seed(
     config: RunConfig,
     seed: int,
@@ -2627,6 +2914,12 @@ def _train_one_seed(
         jump_mode=config.sde_jump_mode,
         jump_initial_intensity=config.sde_jump_initial_intensity,
         jump_initial_std=config.sde_jump_initial_std,
+        stock_embedding_dim=config.stock_embedding_dim,
+        cross_attention_layers=config.cross_attention_layers,
+        attention_dim=config.attention_dim,
+        attention_heads=config.attention_heads,
+        attention_dropout=config.attention_dropout,
+        context_dropout=config.context_dropout,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     sector_ids = None
@@ -2667,16 +2960,32 @@ def _train_one_seed(
     )
     if len(train_loader) == 0:
         raise ValueError("Training set is smaller than one batch; lower --batch-size or download more sessions.")
+    train_monitor_loader = (
+        DataLoader(
+            train_set.subset(config.train_ic_monitor_windows),
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=use_pinned_memory,
+        )
+        if config.train_ic_monitor_windows > 0
+        else None
+    )
 
     best_path = output_dir / f"seed_{seed}_best_signature_affine_mean.pt"
     best_validation_ic = -float("inf")
     best_epoch = 0
     stale_epochs = 0
+    seed_start = time.perf_counter()
+    epoch_durations: list[float] = []
+    batch_count = len(train_loader)
+    progress_every = max(1, batch_count // 10)
     for epoch in range(1, config.max_epochs + 1):
         model.train()
         losses: list[float] = []
         nll_losses: list[float] = []
-        for path, target, target_mask, _ in train_loader:
+        epoch_start = time.perf_counter()
+        for batch_index, (path, target, target_mask, _) in enumerate(train_loader, start=1):
             path = _to_device(path, device, use_pinned_memory)
             target = _to_device(target, device, use_pinned_memory)
             target_mask = _to_device(target_mask, device, use_pinned_memory)
@@ -2699,7 +3008,20 @@ def _train_one_seed(
             grad_scaler.step(optimizer)
             grad_scaler.update()
             losses.append(float(rank_loss.item()))
+            if batch_index % progress_every == 0 or batch_index == batch_count:
+                elapsed = time.perf_counter() - epoch_start
+                left = elapsed / batch_index * (batch_count - batch_index)
+                print(
+                    f"  seed {seed} epoch {epoch:03d}: batch {batch_index}/{batch_count} "
+                    f"({100 * batch_index / batch_count:.0f}%) | {_format_duration(elapsed)} elapsed, "
+                    f"~{_format_duration(left)} left in training pass",
+                    end="\r",
+                    flush=True,
+                )
 
+        train_seconds = time.perf_counter() - epoch_start
+        print(" " * 100, end="\r", flush=True)
+        validation_start = time.perf_counter()
         validation_ic, validation_daily_ic = _validate(
             model,
             validation_loader,
@@ -2720,9 +3042,32 @@ def _train_one_seed(
             )
             if model.jump_mode == "student_t":
                 sde_message += f" | dof {2.0 + float(torch.exp(model.log_dof_minus_two).item()):.2f}"
+        train_ic_message = ""
+        if train_monitor_loader is not None:
+            train_ic, _ = _validate(
+                model, train_monitor_loader, device, use_amp, use_pinned_memory,
+                sector_neutral=config.sector_neutral_objective,
+            )
+            train_ic_message = f" | train-subset Rank IC {train_ic:.5f}"
+        validation_seconds = time.perf_counter() - validation_start
+        epoch_durations.append(time.perf_counter() - epoch_start)
         print(
-            f"Seed {seed} | Epoch {epoch:03d} | train normal-score rank loss {np.mean(losses):.5f} | "
+            f"Seed {seed} | Epoch {epoch:03d} | train normal-score rank loss {np.mean(losses):.5f}{train_ic_message} | "
             f"validation sector-neutral Rank IC {validation_ic:.5f}{sde_message}"
+        )
+        # Upper bound on what is left for this seed: the epoch cap, or early
+        # stopping if validation IC does not improve for `patience` more epochs.
+        improved_now = epoch > config.warmup_epochs and not np.isnan(validation_ic) and validation_ic > best_validation_ic
+        stale_after = 0 if improved_now else (stale_epochs + 1 if epoch > config.warmup_epochs else 0)
+        if epoch <= config.warmup_epochs:
+            remaining = min(config.max_epochs - epoch, config.warmup_epochs - epoch + config.patience)
+        else:
+            remaining = min(config.max_epochs - epoch, config.patience - stale_after)
+        print(
+            f"  time: epoch {_format_duration(epoch_durations[-1])} (train {_format_duration(train_seconds)}, "
+            f"validation {_format_duration(validation_seconds)}) | seed elapsed "
+            f"{_format_duration(time.perf_counter() - seed_start)} | at most {max(remaining, 0)} more epoch(s), "
+            f"<= {_format_duration(max(remaining, 0) * float(np.mean(epoch_durations)))} if no further improvement"
         )
         # Checkpoints are still selected on validation Rank IC, so the SDE and
         # deterministic (diffusion_rank=0) runs are selected by the same rule.
@@ -2864,11 +3209,20 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
     (output_dir / "relative_return_benchmark.json").write_text(
         json.dumps(relative_return_spec, indent=2), encoding="utf-8"
     )
+    etf_bars = load_etf_bars(config.data_dir) if config.use_etf_context else None
+    if config.use_etf_context and etf_bars is None:
+        raise FileNotFoundError(
+            f"use_etf_context=True but no ETF bars in {Path(config.data_dir) / 'etf'}; run download_data.py "
+            "or set USE_ETF_CONTEXT = False."
+        )
     features = engineer_minute_features(
         bars,
         config.holding_minutes,
         sector_median_shrinkage_count=config.sector_median_shrinkage_count,
+        etf_bars=etf_bars,
     )
+    del etf_bars
+    features = apply_feature_drops(features, config.drop_feature_groups)
     print(
         "Relative-price benchmark: sector median shrunk to universe median "
         f"with k={config.sector_median_shrinkage_count:g}; "
@@ -3464,6 +3818,9 @@ def parse_args() -> RunConfig:
         "--sde-jump-initial-intensity", type=float, default=RunConfig.sde_jump_initial_intensity
     )
     parser.add_argument("--sde-jump-initial-std", type=float, default=RunConfig.sde_jump_initial_std)
+    parser.add_argument("--no-etf-context", action="store_true")
+    parser.add_argument("--stock-embedding-dim", type=int, default=RunConfig.stock_embedding_dim)
+    parser.add_argument("--cross-attention-layers", type=int, default=RunConfig.cross_attention_layers)
     parser.add_argument(
         "--validation-only",
         action="store_true",
@@ -3507,6 +3864,9 @@ def parse_args() -> RunConfig:
         sde_jump_initial_intensity=args.sde_jump_initial_intensity,
         sde_jump_initial_std=args.sde_jump_initial_std,
         evaluate_test=not args.validation_only,
+        use_etf_context=not args.no_etf_context,
+        stock_embedding_dim=args.stock_embedding_dim,
+        cross_attention_layers=args.cross_attention_layers,
     )
 
 

@@ -21,6 +21,8 @@ except ImportError as exc:
 
 from minute_alpha import (
     DIRECTIONAL_MULTISCALE_COLUMNS,
+    EXTRA_CONTEXT_ENDPOINT_COLUMNS,
+    EXTRA_CONTEXT_MEAN_COLUMNS,
     FEATURE_COLUMNS,
     HAS_TRADE_FEATURE_INDEX,
     INITIAL_STATE_ANCHOR_COLUMNS,
@@ -46,10 +48,13 @@ from minute_alpha import (
     fit_cross_ticker_area_pca,
     fit_feature_scaler,
     fit_profitability_gate,
+    apply_feature_drops,
+    load_etf_bars,
     load_minute_bars,
     split_by_session,
 )
 from project_settings import (
+    DROP_FEATURE_GROUPS,
     BOOTSTRAP_ITERATIONS,
     DATA_DIR,
     ENSEMBLE_SEEDS,
@@ -72,6 +77,7 @@ from project_settings import (
     TRAIN_RATIO,
     TRAIN_SAMPLE_STRIDE_MINUTES,
     UNIVERSE,
+    USE_ETF_CONTEXT,
     VALIDATION_RATIO,
     WINDOW_MINUTES,
     Z_SCORE_THRESHOLD,
@@ -84,6 +90,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # One folder per universe and evaluation stride, so earlier results are never
 # overwritten (the original 25-name run lives in artifacts/xgboost_comparison).
 XGB_OUTPUT_DIR = Path(OUTPUT_DIR).parent / f"xgboost_{UNIVERSE}_ev{EVALUATION_SAMPLE_STRIDE_MINUTES}"
+if DROP_FEATURE_GROUPS:
+    XGB_OUTPUT_DIR = XGB_OUTPUT_DIR.with_name(XGB_OUTPUT_DIR.name + "_drop-" + "+".join(DROP_FEATURE_GROUPS))
 XGB_BOOSTING_ROUNDS = 400
 XGB_CHECKPOINT_EVERY = 25
 XGB_MAX_DEPTH = 3
@@ -112,6 +120,8 @@ def _feature_names(price_price_components: int, price_volume_components: int) ->
         + [f"signature_area_{i}" for i in range(SELECTIVE_SIGNATURE_DIM - SIGNATURE_PATH_CHANNELS)]
         + state_names
         + list(DIRECTIONAL_MULTISCALE_COLUMNS)
+        + [f"{name}_last" for name in EXTRA_CONTEXT_ENDPOINT_COLUMNS]
+        + [f"{name}_window_mean" for name in EXTRA_CONTEXT_MEAN_COLUMNS]
         + [f"price_price_pca_{i}" for i in range(price_price_components)]
         + [f"price_volume_pca_{i}" for i in range(price_volume_components)]
         + [f"initial_anchor_{name}" for name in INITIAL_STATE_ANCHOR_COLUMNS]
@@ -161,6 +171,7 @@ def _matrix_and_metadata(
                     representation._compact_signature(individual).reshape(batch_size, num_symbols, -1),
                     representation._state_context(individual).reshape(batch_size, num_symbols, -1),
                     representation._directional_multiscale_context(individual).reshape(batch_size, num_symbols, -1),
+                    representation._extra_context(individual).reshape(batch_size, num_symbols, -1),
                     shared_context,
                     _initial_state_inputs(individual).reshape(batch_size, num_symbols, -1),
                 ],
@@ -354,10 +365,16 @@ def main() -> None:
         "training_objective": "grouped rank:pairwise; validation checkpoint selected by mean daily sector-neutral Rank IC",
         "universe": UNIVERSE,
         "evaluate_test": EVALUATE_TEST,
+        "drop_feature_groups": list(DROP_FEATURE_GROUPS),
     }
     (output_dir / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     bars = load_minute_bars(data_dir, TICKERS)
-    features = engineer_minute_features(bars, HOLDING_MINUTES, SECTOR_MEDIAN_SHRINKAGE_COUNT)
+    etf_bars = load_etf_bars(data_dir) if USE_ETF_CONTEXT else None
+    if USE_ETF_CONTEXT and etf_bars is None:
+        raise FileNotFoundError(f"USE_ETF_CONTEXT=True but no ETF bars in {data_dir / 'etf'}; run download_data.py.")
+    features = engineer_minute_features(bars, HOLDING_MINUTES, SECTOR_MEDIAN_SHRINKAGE_COUNT, etf_bars=etf_bars)
+    features = apply_feature_drops(features, DROP_FEATURE_GROUPS)
+    del etf_bars
     del bars
     train_raw, validation_raw, test_raw = split_by_session(features, TRAIN_RATIO, VALIDATION_RATIO)
     del features

@@ -18,6 +18,8 @@ from typing import Iterable
 import pandas as pd
 import requests
 
+from universe import SYMBOL_HISTORY
+
 
 API_URL = "https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/minute/{start}/{end}"
 DEFAULT_TICKERS = (
@@ -144,6 +146,20 @@ class MassiveClient:
         return _normalise_results(results, ticker.upper())
 
 
+def _segments(ticker: str, start: date, end: date) -> list[tuple[str, date, date]]:
+    """(vendor symbol, start, end) pieces covering [start, end] for one stored ticker."""
+    history = SYMBOL_HISTORY.get(ticker)
+    if not history:
+        return [(ticker, start, end)]
+    pieces = []
+    for symbol, piece_start, piece_end in history:
+        lo = max(start, date.fromisoformat(piece_start)) if piece_start else start
+        hi = min(end, date.fromisoformat(piece_end)) if piece_end else end
+        if lo <= hi:
+            pieces.append((symbol, lo, hi))
+    return pieces
+
+
 def download_tickers(
     tickers: Iterable[str],
     output_dir: Path,
@@ -177,12 +193,28 @@ def download_tickers(
 
     for ticker in sorted({item.upper() for item in tickers}):
         destination = output_dir / f"{ticker}.parquet"
-        if destination.exists() and not overwrite:
+        segments = _segments(ticker, start, end)
+        segment_record = [[symbol, lo.isoformat(), hi.isoformat()] for symbol, lo, hi in segments]
+        previous = previous_files.get(ticker, {}) if isinstance(previous_files.get(ticker), dict) else {}
+        stale_history = ticker in SYMBOL_HISTORY and previous.get("segments") != segment_record
+        if destination.exists() and stale_history:
+            print(f"Refreshing {ticker}: stored file predates its ticker-history stitching {segment_record}.")
+        elif destination.exists() and not overwrite:
             print(f"Skipping {ticker}: {destination.name} already exists (use --overwrite to refresh).")
             continue
         print(f"Downloading {ticker}: {start} to {end} …")
         try:
-            frame = client.minute_aggregates(ticker, start, end)
+            pieces = []
+            for symbol, lo, hi in segments:
+                piece = client.minute_aggregates(symbol, lo, hi)
+                piece["symbol"] = ticker
+                pieces.append(piece)
+            frame = (
+                pd.concat(pieces, ignore_index=True).drop_duplicates("timestamp", keep="last").sort_values("timestamp")
+                .reset_index(drop=True)
+                if pieces
+                else pd.DataFrame()
+            )
         except MassiveDownloadError as exc:
             print(f"  FAILED {ticker}: {exc}")
             failed.append(ticker)
@@ -194,6 +226,7 @@ def download_tickers(
         frame.to_parquet(destination, index=False)
         manifest["files"][ticker] = {
             "path": destination.name,
+            "segments": segment_record,
             "rows": int(len(frame)),
             "first_timestamp": frame["timestamp"].min().isoformat(),
             "last_timestamp": frame["timestamp"].max().isoformat(),
