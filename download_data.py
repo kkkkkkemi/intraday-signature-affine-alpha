@@ -11,7 +11,8 @@ from datetime import date
 from pathlib import Path
 
 from massive_download import download_tickers, load_local_env
-from project_settings import DATA_DIR, END_DATE, START_DATE, TICKERS
+from project_settings import DATA_DIR, END_DATE, START_DATE, TICKERS, USE_ETF_CONTEXT
+from universe import ETF_TICKERS
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -28,6 +29,15 @@ def main() -> None:
         start=date.fromisoformat(START_DATE),
         end=date.fromisoformat(END_DATE),
     )
+    if USE_ETF_CONTEXT:
+        # Market and sector ETFs for the context features, in their own subfolder so
+        # they are never mistaken for universe members.
+        download_tickers(
+            tickers=ETF_TICKERS,
+            output_dir=data_dir / "etf",
+            start=date.fromisoformat(START_DATE),
+            end=date.fromisoformat(END_DATE),
+        )
 
 
 if __name__ == "__main__":

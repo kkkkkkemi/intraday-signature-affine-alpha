@@ -75,7 +75,33 @@ SECTOR_BY_SYMBOL: dict[str, str] = {
 
 SP100_AT_START = tuple(sorted(SECTOR_BY_SYMBOL))
 
+# Exchange ticker history for names whose symbol changed inside the sample.  The
+# data vendor is queried by symbol string, so each segment is downloaded under
+# the symbol valid at the time and stored under the current symbol.
+# BNY Mellon traded as BK through 2026-05-20 and as BNY from 2026-05-21; before
+# that date "BNY" belonged to an unrelated, thinly traded security.
+SYMBOL_HISTORY: dict[str, tuple[tuple[str, str | None, str | None], ...]] = {
+    "BNY": (("BK", None, "2026-05-20"), ("BNY", "2026-05-21", None)),
+}
+
 UNIVERSES = {"mega25": MEGA25, "sp100": SP100_AT_START}
+
+# Market and SPDR sector ETFs used as context features (downloaded to DATA_DIR/etf).
+MARKET_ETF = "SPY"
+SECTOR_ETF: dict[str, str] = {
+    "Information Technology": "XLK",
+    "Financials": "XLF",
+    "Health Care": "XLV",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Utilities": "XLU",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Communication Services": "XLC",
+}
+ETF_TICKERS = (MARKET_ETF, *sorted(set(SECTOR_ETF.values())))
 
 
 def universe(name: str) -> tuple[str, ...]:

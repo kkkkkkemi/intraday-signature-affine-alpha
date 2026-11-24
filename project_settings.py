@@ -20,7 +20,8 @@ DATA_DIR = {"sp100": "minute_data_sp100", "mega25": "minute_data"}[UNIVERSE]
 # Earlier 25-name runs (kept for reference):
 #   artifacts/linsde_r4_nll0p1_n25_sig91_state7_ens42_43_44_pp_pca12_pv_pca16_w30_h30_tr5_ev30   (Gaussian)
 #   artifacts/linsde_r4_merton_nll0p1_clip20_n25_sig91_state7_ens42_43_44_pp_pca12_pv_pca16_w30_h30_tr5_ev30 (Merton)
-OUTPUT_DIR = f"artifacts/{UNIVERSE}_linsde_r4_merton_nll0p1_clip20_ens42_43_44_pp_pca12_pv_pca16_w30_h30_tr5_ev5"
+#   artifacts/sp100_linsde_r4_merton_nll0p1_clip20_ens42_43_44_pp_pca12_pv_pca16_w30_h30_tr5_ev5 (first sp100 run, v1 features)
+OUTPUT_DIR = f"artifacts/{UNIVERSE}_v2feat_emb8_att1_linsde_r4_merton_nll0p1_clip20_ens42_43_44_w30_h30_tr5_ev5"
 # Massive Basic serves roughly the most recent two years of minute aggregates.
 # The window is pinned (it is the one used for the 2026-11-23 sp100 download) so
 # that re-running download_data.py to retry failed tickers fetches the same dates.
@@ -37,8 +38,9 @@ HOLDING_MINUTES = 30
 TRAIN_RATIO = 0.70
 VALIDATION_RATIO = 0.15
 BATCH_SIZE = 16
-MAX_EPOCHS = 60
-PATIENCE = 10
+# The train/validation IC gap opens within a few epochs, so stop early.
+MAX_EPOCHS = 30
+PATIENCE = 5
 WARMUP_EPOCHS = 3
 # Minimum labelled names per cross-section (~60% of the universe).
 MIN_LABELLED_SYMBOLS = {"sp100": 60, "mega25": 15}[UNIVERSE]
@@ -124,5 +126,30 @@ SDE_JUMP_INITIAL_STD = 2.0
 
 # Tuning discipline: while False, train_model.py never scores the test split and
 # skips the gate / OOS evaluation.  Set True only for the final frozen run.
-# (tune_sde.py always runs validation-only.)
 EVALUATE_TEST = False
+
+# v2 inputs: volume surprise, trade counts/size, session context, and SPY /
+# sector-ETF returns (ETF bars live in DATA_DIR/etf; download_data.py fetches them).
+USE_ETF_CONTEXT = True
+# Architecture: per-stock embedding and transformer layers across the stocks of
+# each cross-section (0 disables either, for ablations).
+STOCK_EMBEDDING_DIM = 8
+CROSS_ATTENTION_LAYERS = 1
+ATTENTION_DIM = 64
+ATTENTION_HEADS = 4
+# Training windows scored each epoch to log train-vs-validation Rank IC.
+TRAIN_IC_MONITOR_WINDOWS = 2000
+# Regularisation (AdamW weight decay, dropout on the SDE conditioning context and
+# inside the cross-stock attention).
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+CONTEXT_DROPOUT = 0.0
+ATTENTION_DROPOUT = 0.1
+# v2 feature groups to switch off (set to zero), for ablations; choose from
+# "day_constant", "volume_flow", "session", "etf" (see minute_alpha.FEATURE_GROUPS).
+DROP_FEATURE_GROUPS: tuple[str, ...] = ()
+# Tag the run directory with the early-stopping / regularisation / ablation
+# settings so a new configuration never overwrites an earlier run.
+OUTPUT_DIR += f"_p{PATIENCE}_wd{WEIGHT_DECAY:g}_do{CONTEXT_DROPOUT:g}"
+if DROP_FEATURE_GROUPS:
+    OUTPUT_DIR += "_drop-" + "+".join(DROP_FEATURE_GROUPS)

@@ -21,7 +21,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from project_settings import DATA_DIR, TICKERS
+from project_settings import DATA_DIR, TICKERS, USE_ETF_CONTEXT
+from universe import ETF_TICKERS
 
 PROJECT_DIR = Path(__file__).resolve().parent
 FULL_SESSION_MINUTES = 390
@@ -46,6 +47,14 @@ def session_last_minute(frame: pd.DataFrame) -> pd.Series:
 
 
 def analyse(bars_by_ticker: dict[str, pd.DataFrame], tickers: list[str]) -> tuple[dict, pd.DataFrame]:
+    if not bars_by_ticker:
+        empty = {
+            "tickers_requested": len(tickers), "tickers_with_files": 0, "missing_files": sorted(tickers),
+            "calendar_sessions": 0, "calendar_range": [None, None], "sessions_lost_with_all_tickers": 0,
+            "lost_sessions_examples": [], "suggested_drops": [], "sessions_lost_after_drops": 0,
+            "lowest_bar_coverage": [], "short_sessions": {}, "final_session": None, "data_dir": str(DATA_DIR),
+        }
+        return empty, pd.DataFrame()
     per_ticker = {ticker: session_minutes(frame) for ticker, frame in bars_by_ticker.items()}
     last_minute = (
         pd.concat({ticker: session_last_minute(frame) for ticker, frame in bars_by_ticker.items()}, axis=1).max(axis=1)
@@ -131,6 +140,18 @@ def main() -> None:
         if path.exists():
             bars[ticker] = pd.read_parquet(path, columns=["timestamp"])
     report, table = analyse(bars, list(TICKERS))
+    if USE_ETF_CONTEXT:
+        etf_dir = data_dir / "etf"
+        etf_bars = {
+            ticker: pd.read_parquet(etf_dir / f"{ticker}.parquet", columns=["timestamp"])
+            for ticker in ETF_TICKERS
+            if (etf_dir / f"{ticker}.parquet").exists()
+        }
+        etf_report, _ = analyse(etf_bars, list(ETF_TICKERS))
+        report["etf"] = {
+            key: etf_report[key]
+            for key in ("tickers_with_files", "missing_files", "calendar_range", "sessions_lost_with_all_tickers", "lowest_bar_coverage")
+        }
     (data_dir / "coverage_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     table.to_csv(data_dir / "coverage_by_ticker.csv", index=False)
 
@@ -138,6 +159,12 @@ def main() -> None:
     if report["missing_files"]:
         print(f"  Missing files (download again or drop): {report['missing_files']}")
     print(f"Calendar: {report['calendar_sessions']} sessions {report['calendar_range']}")
+    if "etf" in report:
+        etf = report["etf"]
+        print(
+            f"Context ETFs: {etf['tickers_with_files']}/{len(ETF_TICKERS)} files, missing {etf['missing_files'] or 'none'}, "
+            f"range {etf['calendar_range']}, sessions with a missing ETF {etf['sessions_lost_with_all_tickers']}"
+        )
     if report["short_sessions"]:
         print(f"Sessions ending before 15:59 NY (last bar time): {report['short_sessions']}")
         print("  -> 13:00 early closes are kept; partial days (incl. an unfinished final day) are dropped in training.")

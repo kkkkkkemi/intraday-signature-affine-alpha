@@ -79,7 +79,12 @@ def test_van_loan_matches_monte_carlo() -> None:
 
 
 def _toy_model(
-    diffusion_rank: int, num_symbols: int = 5, latent_dim: int = 4, jump_mode: str = "none"
+    diffusion_rank: int,
+    num_symbols: int = 5,
+    latent_dim: int = 4,
+    jump_mode: str = "none",
+    stock_embedding_dim: int = 0,
+    cross_attention_layers: int = 0,
 ) -> SignatureConditionedAffineMeanModel:
     rng = np.random.default_rng(0)
     pp = num_symbols * (num_symbols - 1) // 2
@@ -104,6 +109,10 @@ def _toy_model(
         cross_area_pca=pca,
         diffusion_rank=diffusion_rank,
         jump_mode=jump_mode,
+        stock_embedding_dim=stock_embedding_dim,
+        cross_attention_layers=cross_attention_layers,
+        attention_dim=16,
+        attention_heads=4,
     ).float()
 
 
@@ -224,6 +233,31 @@ def test_sector_neutral_rank_loss_ignores_sector_offsets() -> None:
     torch.set_default_dtype(torch.float64)
 
 
+def test_embedding_and_cross_attention() -> None:
+    torch.set_default_dtype(torch.float32)
+    torch.manual_seed(1)
+    path = torch.randn(3, 5, 30, len(FEATURE_COLUMNS))
+    model = _toy_model(diffusion_rank=2, jump_mode="merton", stock_embedding_dim=4, cross_attention_layers=1)
+    model.eval()
+    parameters = model.forward_predictive(path)
+    assert parameters["mean"].shape == (3, 5) and torch.isfinite(parameters["total_variance"]).all()
+    # The attention layer lets one stock's path move another stock's forecast.
+    perturbed = path.clone()
+    perturbed[:, 4, :, :] += 1.0
+    with torch.no_grad():
+        moved = (model(perturbed)[:, 0] - model(path)[:, 0]).abs().max().item()
+    assert moved > 0, moved
+    model.train()
+    loss = PredictiveNLL(1e-3, 20.0, "merton")(model.forward_predictive(path), torch.randn(3, 5) * 3e-3, torch.ones(3, 5, dtype=torch.bool))
+    loss.backward()
+    named = dict(model.named_parameters())
+    for name in ("stock_embedding.weight", "attention_input.1.weight", "cross_attention.layers.0.self_attn.in_proj_weight"):
+        gradient = named[name].grad
+        assert gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0, name
+    print(f"PASS stock embedding + cross-stock attention: gradients flow, cross-stock effect {moved:.2e}")
+    torch.set_default_dtype(torch.float64)
+
+
 if __name__ == "__main__":
     test_van_loan_matches_quadrature()
     test_van_loan_matches_monte_carlo()
@@ -232,4 +266,5 @@ if __name__ == "__main__":
     test_merton_and_student_t_likelihoods_match_scipy()
     test_jump_heads_receive_gradients()
     test_sector_neutral_rank_loss_ignores_sector_offsets()
+    test_embedding_and_cross_attention()
     print("All linear-SDE checks passed.")

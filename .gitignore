@@ -17,6 +17,10 @@ artifacts/
 *.npz
 *.pkl
 *.pickle
+code_bundle.txt
+# Local, obsolete LOBSTER prototypes; not part of the minute-OHLCV pipeline.
+eval_script.py
+signature.py
 
 # Python and logs
 __pycache__/
