@@ -20,6 +20,9 @@ from project_settings import (
     ATTENTION_HEADS,
     CONTEXT_DROPOUT,
     DROP_FEATURE_GROUPS,
+    SDE_HORIZON_JUMP_MAX_COUNT,
+    SDE_HORIZON_RANK_ALL,
+    SDE_HORIZON_STEPS,
     LEARNING_RATE,
     WEIGHT_DECAY,
     CROSS_ATTENTION_LAYERS,
@@ -134,6 +137,9 @@ def main() -> None:
             context_dropout=CONTEXT_DROPOUT,
             attention_dropout=ATTENTION_DROPOUT,
             drop_feature_groups=tuple(DROP_FEATURE_GROUPS),
+            sde_horizon_steps=SDE_HORIZON_STEPS,
+            sde_horizon_jump_max_count=SDE_HORIZON_JUMP_MAX_COUNT,
+            sde_horizon_rank_all=SDE_HORIZON_RANK_ALL,
         )
     )
 

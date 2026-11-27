@@ -216,6 +216,12 @@ class RunConfig:
     sde_jump_max_count: int = 8
     sde_jump_initial_intensity: float = 0.05
     sde_jump_initial_std: float = 2.0
+    # Multi-horizon likelihood: fit the cumulative return at K equally spaced
+    # points of the holding period jointly (1 = endpoint only, the original model).
+    sde_horizon_steps: int = 1
+    sde_horizon_jump_max_count: int = 3
+    # Also apply the rank loss at every intermediate horizon (averaged).
+    sde_horizon_rank_all: bool = False
     # False while tuning: the test split is never scored, and the execution /
     # gate / OOS evaluation is skipped.  Set True once for the final frozen run.
     evaluate_test: bool = True
@@ -832,6 +838,7 @@ class CrossSectionalMinuteDataset(Dataset):
         target_mask_parts: list[np.ndarray] = []
         entry_parts: list[np.ndarray] = []
         exit_parts: list[np.ndarray] = []
+        close_parts: list[np.ndarray] = []
         timestamp_parts: list[np.ndarray] = []
         session_parts: list[np.ndarray] = []
         sample_end_indices: list[int] = []
@@ -854,6 +861,7 @@ class CrossSectionalMinuteDataset(Dataset):
             target_mask = np.zeros((len(index), len(self.symbols)), dtype=bool)
             entry = np.empty((len(index), len(self.symbols)), dtype=np.float32)
             exit_ = np.empty((len(index), len(self.symbols)), dtype=np.float32)
+            close = np.empty((len(index), len(self.symbols)), dtype=np.float32)
             input_available = np.ones(len(index), dtype=bool)
             for symbol_index, symbol in enumerate(self.symbols):
                 symbol_frame = session_frame[session_frame["symbol"] == symbol].set_index("timestamp").reindex(index)
@@ -871,6 +879,9 @@ class CrossSectionalMinuteDataset(Dataset):
                 target_mask[:, symbol_index] = valid_target
                 entry[:, symbol_index] = symbol_frame["entry_price"].to_numpy(dtype=np.float32)
                 exit_[:, symbol_index] = symbol_frame["exit_price"].to_numpy(dtype=np.float32)
+                # Last traded price at the close of each minute (carried forward on
+                # minutes without a trade): what is known at the decision time.
+                close[:, symbol_index] = symbol_frame["close"].to_numpy(dtype=np.float32)
 
             x_parts.append(x)
             raw_target_parts.append(raw_target)
@@ -878,6 +889,7 @@ class CrossSectionalMinuteDataset(Dataset):
             target_mask_parts.append(target_mask)
             entry_parts.append(entry)
             exit_parts.append(exit_)
+            close_parts.append(close)
             timestamp_parts.append(index.to_numpy())
             session_parts.append(np.repeat(session, len(index)))
             for local_end in range(window_minutes - 1, len(index)):
@@ -901,6 +913,7 @@ class CrossSectionalMinuteDataset(Dataset):
         self.target_masks = np.concatenate(target_mask_parts, axis=0)
         self.entry_prices = np.concatenate(entry_parts, axis=0)
         self.exit_prices = np.concatenate(exit_parts, axis=0)
+        self.close_prices = np.concatenate(close_parts, axis=0)
         self.timestamps = np.concatenate(timestamp_parts, axis=0)
         self.sessions = np.concatenate(session_parts, axis=0)
         self.sample_end_indices = np.array(sample_end_indices, dtype=np.int64)
@@ -916,6 +929,85 @@ class CrossSectionalMinuteDataset(Dataset):
             positions = np.unique(np.linspace(0, len(self.sample_end_indices) - 1, max_windows).astype(np.int64))
             clone.sample_end_indices = self.sample_end_indices[positions]
         return clone
+
+    def _ensure_sector_maps(self) -> None:
+        if not hasattr(self, "_sector_codes"):
+            sector_names = sorted({SECTOR_BY_SYMBOL[symbol] for symbol in self.symbols})
+            self._sector_codes = np.array([sector_names.index(SECTOR_BY_SYMBOL[symbol]) for symbol in self.symbols])
+            self._sector_one_hot = np.eye(len(sector_names), dtype=np.float64)[self._sector_codes]
+
+    def horizon_targets(
+        self, sample_indices: Iterable[int] | np.ndarray, horizon_steps: int, holding_minutes: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sector-excess cumulative log returns at tau_k = k * holding / K, k = 1..K.
+
+        Partial returns run from the entry open(t+1) to open(t+1+tau_k), both
+        inside the same session, and are demeaned within sector over the names
+        valid at that horizon (a sector needs two).  The last horizon equals the
+        training target.  Returns ``targets`` [B, N, K] (float32, zero where
+        invalid) and ``mask`` [B, N]: every horizon is valid and the name carries
+        the ordinary 30-minute label.
+        """
+        if horizon_steps < 1 or holding_minutes % horizon_steps != 0:
+            raise ValueError("holding_minutes must be a positive multiple of horizon_steps.")
+        self._ensure_sector_maps()
+        ends = self.sample_end_indices[np.asarray(sample_indices, dtype=np.int64)]
+        # entry_prices[t] is the raw open of minute t+1, so the open at t+1+tau is
+        # entry_prices[t+tau] on the dense within-session grid.
+        offsets = (holding_minutes // horizon_steps) * np.arange(1, horizon_steps + 1)
+        exit_rows = ends[:, None] + offsets[None, :]
+        in_range = exit_rows < len(self.entry_prices)
+        exit_rows = np.minimum(exit_rows, len(self.entry_prices) - 1)
+        same_session = in_range & (self.sessions[exit_rows] == self.sessions[ends][:, None])
+        entry = self.entry_prices[ends].astype(np.float64)[:, None, :]
+        exit_ = self.entry_prices[exit_rows].astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(exit_ / entry)
+        valid = np.isfinite(raw) & (entry > 0.0) & (exit_ > 0.0) & same_session[:, :, None]
+        raw = np.where(valid, raw, 0.0)
+        sector_sum = raw @ self._sector_one_hot
+        sector_count = valid.astype(np.float64) @ self._sector_one_hot
+        sector_mean = sector_sum / np.maximum(sector_count, 1.0)
+        excess = raw - sector_mean[..., self._sector_codes]
+        valid &= sector_count[..., self._sector_codes] >= 2.0
+        mask = valid.all(axis=1) & self.target_masks[ends]
+        targets = np.where(valid, excess, 0.0).transpose(0, 2, 1).astype(np.float32)
+        return targets, mask
+
+    def observed_partial_returns(
+        self, sample_indices: Iterable[int] | np.ndarray, horizon_steps: int, holding_minutes: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Causal version of the first K-1 horizon returns, for the holding-period filter.
+
+        ``horizon_targets`` ends partial return k at open(t+1+tau_k), which is the
+        execution price of a trade decided at the close of minute t+tau_k and the
+        first price of the remaining return: conditioning on it would leak one
+        tick (bid-ask bounce) into the filter.  Here partial return k ends at the
+        last traded price at the close of minute t+tau_k instead, which is known
+        when the update is made.  Sector-demeaned like ``horizon_targets``.
+        Returns ``observed`` [B, N, K-1] and ``mask`` [B, N].
+        """
+        if horizon_steps < 2 or holding_minutes % horizon_steps != 0:
+            raise ValueError("holding_minutes must be a multiple of horizon_steps >= 2.")
+        self._ensure_sector_maps()
+        ends = self.sample_end_indices[np.asarray(sample_indices, dtype=np.int64)]
+        offsets = (holding_minutes // horizon_steps) * np.arange(1, horizon_steps)
+        rows = ends[:, None] + offsets[None, :]
+        in_range = rows < len(self.close_prices)
+        rows = np.minimum(rows, len(self.close_prices) - 1)
+        same_session = in_range & (self.sessions[rows] == self.sessions[ends][:, None])
+        entry = self.entry_prices[ends].astype(np.float64)[:, None, :]
+        close = self.close_prices[rows].astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.log(close / entry)
+        valid = np.isfinite(raw) & (entry > 0.0) & (close > 0.0) & same_session[:, :, None]
+        raw = np.where(valid, raw, 0.0)
+        sector_sum = raw @ self._sector_one_hot
+        sector_count = valid.astype(np.float64) @ self._sector_one_hot
+        excess = raw - (sector_sum / np.maximum(sector_count, 1.0))[..., self._sector_codes]
+        valid &= sector_count[..., self._sector_codes] >= 2.0
+        observed = np.where(valid, excess, 0.0).transpose(0, 2, 1).astype(np.float32)
+        return observed, valid.all(axis=1)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         end = self.sample_end_indices[index]
@@ -1169,8 +1261,16 @@ class SignatureConditionedAffineMeanModel(nn.Module):
         attention_heads: int = 4,
         attention_dropout: float = 0.1,
         context_dropout: float = 0.0,
+        horizon_steps: int = 1,
     ) -> None:
         super().__init__()
+        if horizon_steps < 1:
+            raise ValueError("horizon_steps must be at least 1.")
+        if horizon_steps > 1 and diffusion_rank <= 0:
+            raise ValueError("A multi-horizon likelihood needs diffusion_rank > 0.")
+        if horizon_steps > 1 and jump_mode == "student_t":
+            raise ValueError("The multi-horizon likelihood supports jump_mode 'none' or 'merton'.")
+        self.horizon_steps = int(horizon_steps)
         if not 0.0 <= context_dropout < 1.0:
             raise ValueError("context_dropout must lie in [0, 1).")
         if stock_embedding_dim < 0 or cross_attention_layers < 0:
@@ -1316,8 +1416,13 @@ class SignatureConditionedAffineMeanModel(nn.Module):
             # objective; the NLL term then grows the volatility it can explain.
             nn.init.normal_(self.diffusion_network[-1].weight, std=1e-3)
             nn.init.constant_(self.diffusion_network[-1].bias, 0.1 / math.sqrt(latent_dim * self.diffusion_rank))
-            # Global homoskedastic observation noise, log-parameterised.
+            # Global homoskedastic observation noise, log-parameterised.  In the
+            # multi-horizon model it is the scale of an idiosyncratic Brownian
+            # motion in the observed cumulative return (variance grows with tau),
+            # and a small white measurement noise is added on top.
             self.log_observation_std = nn.Parameter(torch.tensor(0.0))
+            if self.horizon_steps > 1:
+                self.log_measurement_std = nn.Parameter(torch.tensor(-3.0))
         if self.jump_mode == "merton":
             # Context-dependent jump intensity lambda(c) and jump variance s_J(c)^2.
             self.jump_network = nn.Sequential(
@@ -1535,9 +1640,7 @@ class SignatureConditionedAffineMeanModel(nn.Module):
         assert gaussian_variance is not None
         result = {"mean": mean, "gaussian_variance": gaussian_variance, "total_variance": gaussian_variance}
         if self.jump_mode == "merton":
-            raw = self.jump_network(context).float()
-            intensity = torch.nn.functional.softplus(raw[:, 0]).view_as(mean) + 1e-6
-            jump_variance = torch.nn.functional.softplus(raw[:, 1]).view_as(mean) + 1e-4
+            intensity, jump_variance = self._jump_parameters(context, mean)
             result["jump_intensity"] = intensity
             result["jump_variance"] = jump_variance
             result["total_variance"] = gaussian_variance + intensity * jump_variance
@@ -1551,9 +1654,15 @@ class SignatureConditionedAffineMeanModel(nn.Module):
         parameters = self.forward_predictive(path)
         return parameters["mean"], parameters["total_variance"]
 
-    def _latent_endpoint(
-        self, path: torch.Tensor, need_covariance: bool
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    def _jump_parameters(self, context: torch.Tensor, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Merton intensity lambda(c) over the holding period and jump variance s_J(c)^2."""
+        raw = self.jump_network(context).float()
+        intensity = torch.nn.functional.softplus(raw[:, 0]).view_as(like) + 1e-6
+        jump_variance = torch.nn.functional.softplus(raw[:, 1]).view_as(like) + 1e-4
+        return intensity, jump_variance
+
+    def _dynamics(self, path: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Context, initial state Z_0, drift matrix A(c) and intercept b(c) (fp32)."""
         if path.ndim != 4:
             raise ValueError("Expected path with shape [batch, symbols, time, features].")
         batch_size, num_symbols, path_length, input_channels = path.shape
@@ -1588,9 +1697,13 @@ class SignatureConditionedAffineMeanModel(nn.Module):
 
         # Matrix exponentials are deliberately evaluated in fp32 even when the
         # optional outer AMP context is enabled.
-        drift_matrix = drift_matrix.float()
-        drift_intercept = drift_intercept.float()
-        initial_state = initial_state.float()
+        return context, initial_state.float(), drift_matrix.float(), drift_intercept.float()
+
+    def _latent_endpoint(
+        self, path: torch.Tensor, need_covariance: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        batch_size, num_symbols = path.shape[0], path.shape[1]
+        context, initial_state, drift_matrix, drift_intercept = self._dynamics(path)
         augmented = torch.zeros(
             batch_size * num_symbols,
             self.latent_dim + 1,
@@ -1606,6 +1719,9 @@ class SignatureConditionedAffineMeanModel(nn.Module):
             + transition[:, : self.latent_dim, self.latent_dim]
         )
         mean = self.readout(mean_endpoint).view(batch_size, num_symbols)
+        if self.horizon_steps > 1:
+            # Cumulative-return readout y(tau) = w'(Z_tau - Z_0) + q tau, so y(0) = 0.
+            mean = mean - (initial_state @ self.readout.weight.float().view(-1)).view(batch_size, num_symbols)
         if not need_covariance:
             return mean, None, context
 
@@ -1621,8 +1737,100 @@ class SignatureConditionedAffineMeanModel(nn.Module):
             batch_size, num_symbols
         )
         observation_variance = torch.exp(2.0 * self.log_observation_std.float())
+        if self.horizon_steps > 1:
+            observation_variance = observation_variance + torch.exp(2.0 * self.log_measurement_std.float())
         variance = diffusion_variance.clamp_min(0.0) + observation_variance
         return mean, variance, context
+
+    def forward_horizon(self, path: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Joint law of the cumulative return on the grid tau_k = k/K, k = 1..K.
+
+        With step h = 1/K, Phi = exp(A h) and P_h = int_0^h exp(As) Q exp(A's) ds
+        (Van Loan), the latent moments follow the exact recursions
+
+            m_k = Phi m_{k-1} + c_h,    P_k = Phi P_{k-1} Phi' + P_h,
+            Cov(Z_j, Z_k) = P_j (Phi')^{k-j}  for j <= k,
+
+        and y(tau) = w'(Z_tau - Z_0) + q tau + sigma_B B_tau + eps gives
+
+            E y_k = w'(m_k - m_0) + q tau_k,
+            Cov(y_j, y_k) = w' P_j (Phi')^{k-j} w + sigma_B^2 min(tau_j, tau_k) + sigma_e^2 1{j=k}.
+
+        Merton jumps (zero mean) arrive at rate lambda(c) over the whole holding
+        period; their contribution is handled by ``MultiHorizonNLL``.  Returned
+        keys: ``horizon_mean`` [B, N, K], ``horizon_covariance`` [B, N, K, K]
+        (Gaussian part), the endpoint keys of ``forward_predictive``, and the jump
+        parameters for Merton.
+        """
+        if self.horizon_steps < 2:
+            raise RuntimeError("forward_horizon requires horizon_steps > 1.")
+        batch_size, num_symbols = path.shape[0], path.shape[1]
+        context, initial_state, drift_matrix, drift_intercept = self._dynamics(path)
+        n, d, steps = drift_matrix.shape[0], self.latent_dim, self.horizon_steps
+        step = 1.0 / steps
+        augmented = torch.zeros(n, d + 1, d + 1, device=path.device, dtype=torch.float32)
+        augmented[:, :d, :d] = drift_matrix
+        augmented[:, :d, d] = drift_intercept
+        step_transition = torch.matrix_exp(augmented * step)
+        phi = step_transition[:, :d, :d]
+        phi_t = phi.transpose(-1, -2)
+        intercept = step_transition[:, :d, d]
+        weight = self.readout.weight.float().view(d)
+        bias = self.readout.bias.float().view(())
+
+        state = initial_state
+        base = initial_state @ weight
+        means = []
+        for k in range(1, steps + 1):
+            state = (phi @ state.unsqueeze(-1)).squeeze(-1) + intercept
+            means.append(state @ weight - base + bias * (k * step))
+        horizon_mean = torch.stack(means, dim=-1)
+
+        loading = self._diffusion_matrix(context).float()
+        diffusion_covariance = loading @ loading.transpose(-1, -2)
+        if self.diffusion_floor > 0.0:
+            diffusion_covariance = diffusion_covariance + self.diffusion_floor * torch.eye(
+                d, device=path.device, dtype=torch.float32
+            )
+        step_covariance = self.van_loan_covariance(drift_matrix * step, diffusion_covariance * step)
+        covariance = torch.zeros(n, d, d, device=path.device, dtype=torch.float32)
+        covariance_weight = []
+        for _ in range(steps):
+            covariance = phi @ covariance @ phi_t + step_covariance
+            covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
+            covariance_weight.append(covariance @ weight)
+        powers = [weight.expand(n, d)]
+        for _ in range(1, steps):
+            powers.append((phi_t @ powers[-1].unsqueeze(-1)).squeeze(-1))
+        rows = []
+        for j in range(steps):
+            row = []
+            for k in range(steps):
+                low, high = min(j, k), max(j, k)
+                row.append((covariance_weight[low] * powers[high - low]).sum(dim=-1))
+            rows.append(torch.stack(row, dim=-1))
+        latent_part = torch.stack(rows, dim=-2)
+        tau = torch.arange(1, steps + 1, device=path.device, dtype=torch.float32) * step
+        brownian = torch.minimum(tau.view(-1, 1), tau.view(1, -1))
+        observation = torch.exp(2.0 * self.log_observation_std.float()) * brownian + torch.exp(
+            2.0 * self.log_measurement_std.float()
+        ) * torch.eye(steps, device=path.device, dtype=torch.float32)
+        horizon_covariance = latent_part + observation
+
+        shape = (batch_size, num_symbols)
+        result = {
+            "horizon_mean": horizon_mean.view(*shape, steps),
+            "horizon_covariance": horizon_covariance.view(*shape, steps, steps),
+        }
+        result["mean"] = result["horizon_mean"][..., -1]
+        result["gaussian_variance"] = result["horizon_covariance"][..., -1, -1]
+        result["total_variance"] = result["gaussian_variance"]
+        if self.jump_mode == "merton":
+            intensity, jump_variance = self._jump_parameters(context, result["mean"])
+            result["jump_intensity"] = intensity
+            result["jump_variance"] = jump_variance
+            result["total_variance"] = result["gaussian_variance"] + intensity * jump_variance
+        return result
 
 
 class GaussianPredictiveNLL(nn.Module):
@@ -1707,6 +1915,156 @@ class PredictiveNLL(nn.Module):
         mask = target_mask.to(dtype=torch.float32)
         nll = self.per_label_nll(parameters, target)
         return (nll * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def jump_count_vectors(horizon_steps: int, max_total: int) -> np.ndarray:
+    """All non-negative jump-count vectors over the K sub-intervals with sum <= max_total."""
+    vectors: list[tuple[int, ...]] = []
+
+    def extend(prefix: tuple[int, ...], remaining: int) -> None:
+        if len(prefix) == horizon_steps:
+            vectors.append(prefix)
+            return
+        for count in range(remaining + 1):
+            extend(prefix + (count,), remaining - count)
+
+    extend((), max_total)
+    vectors.sort(key=lambda vector: (sum(vector), vector[::-1]))
+    return np.array(vectors, dtype=np.int64)
+
+
+def _mvn_logpdf(residual: torch.Tensor, covariance: torch.Tensor) -> torch.Tensor:
+    """log N(residual; 0, covariance) for batches of small dense covariances."""
+    dimension = residual.shape[-1]
+    jitter = 1e-6 * torch.eye(dimension, device=residual.device, dtype=residual.dtype)
+    cholesky = torch.linalg.cholesky(covariance + jitter)
+    whitened = torch.linalg.solve_triangular(cholesky, residual.unsqueeze(-1), upper=False).squeeze(-1)
+    log_det = 2.0 * torch.log(torch.diagonal(cholesky, dim1=-2, dim2=-1)).sum(dim=-1)
+    return -0.5 * (whitened.square().sum(dim=-1) + log_det + dimension * math.log(2.0 * math.pi))
+
+
+class MultiHorizonNLL(nn.Module):
+    """Joint NLL of the standardised cumulative returns y_1..y_K of one holding period.
+
+    Gaussian: N(mu, Sigma) from ``forward_horizon``.  Merton: jumps of variance
+    s_J^2 arrive independently in each sub-interval with mean lambda / K.  Given
+    the count vector n, the cumulative jump vector has covariance
+    s_J^2 * C(n) with C(n)_{jk} = sum_{i <= min(j, k)} n_i, so the exact law is
+    the mixture sum_n prod_i Pois(n_i; lambda/K) N(mu, Sigma + s_J^2 C(n)),
+    truncated at ``max_jumps`` jumps in total.  The loss is reported per horizon
+    (joint NLL / K) so that its scale matches the single-horizon NLL weight.
+    """
+
+    def __init__(
+        self, target_scale: float, target_clip: float, mode: str, horizon_steps: int, max_jumps: int = 3
+    ) -> None:
+        super().__init__()
+        if mode not in ("none", "merton"):
+            raise ValueError("MultiHorizonNLL supports mode 'none' or 'merton'.")
+        if horizon_steps < 2:
+            raise ValueError("horizon_steps must be at least 2.")
+        if not target_scale > 0.0 or not target_clip > 0.0:
+            raise ValueError("target_scale and target_clip must be positive.")
+        self.target_scale = float(target_scale)
+        self.target_clip = float(target_clip)
+        self.mode = mode
+        self.horizon_steps = int(horizon_steps)
+        counts = jump_count_vectors(horizon_steps, max_jumps if mode == "merton" else 0)
+        cumulative = np.cumsum(counts, axis=1)
+        index = np.minimum.outer(np.arange(horizon_steps), np.arange(horizon_steps))
+        templates = cumulative[:, index]
+        self.register_buffer("count_totals", torch.tensor(counts.sum(axis=1), dtype=torch.float32), persistent=False)
+        self.register_buffer(
+            "count_log_factorials",
+            torch.tensor(special.gammaln(counts + 1.0).sum(axis=1), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer("jump_templates", torch.tensor(templates, dtype=torch.float32), persistent=False)
+
+    def standardise(self, target: torch.Tensor) -> torch.Tensor:
+        return (target.float() / self.target_scale).clamp(-self.target_clip, self.target_clip)
+
+    def component_laws(self, parameters: dict[str, torch.Tensor], rows: torch.Tensor | None = None):
+        """Flattened mean [n, K], component covariances [n, M, K, K] and log prior weights [n, M]."""
+        steps = self.horizon_steps
+        mean = parameters["horizon_mean"].float().reshape(-1, steps)
+        covariance = parameters["horizon_covariance"].float().reshape(-1, steps, steps)
+        if rows is not None:
+            mean, covariance = mean[rows], covariance[rows]
+        if self.mode == "none":
+            return mean, covariance.unsqueeze(1), torch.zeros(mean.shape[0], 1, device=mean.device)
+        intensity = parameters["jump_intensity"].float().reshape(-1)
+        jump_variance = parameters["jump_variance"].float().reshape(-1)
+        if rows is not None:
+            intensity, jump_variance = intensity[rows], jump_variance[rows]
+        intensity = intensity.clamp_min(1e-8)
+        components = covariance.unsqueeze(1) + jump_variance.view(-1, 1, 1, 1) * self.jump_templates.unsqueeze(0)
+        log_prior = (
+            self.count_totals.unsqueeze(0) * torch.log(intensity / steps).unsqueeze(1)
+            - intensity.unsqueeze(1)
+            - self.count_log_factorials.unsqueeze(0)
+        )
+        return mean, components, log_prior
+
+    def log_likelihood(
+        self, parameters: dict[str, torch.Tensor], target: torch.Tensor, rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        y = self.standardise(target).reshape(-1, self.horizon_steps)
+        if rows is not None:
+            y = y[rows]
+        mean, components, log_prior = self.component_laws(parameters, rows)
+        log_normal = _mvn_logpdf((y - mean).unsqueeze(1).expand(-1, components.shape[1], -1), components)
+        return torch.logsumexp(log_prior + log_normal, dim=1)
+
+    def forward(
+        self, parameters: dict[str, torch.Tensor], target: torch.Tensor, target_mask: torch.Tensor
+    ) -> torch.Tensor:
+        rows = target_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            return parameters["horizon_mean"].sum() * 0.0
+        return -self.log_likelihood(parameters, target, rows).mean() / self.horizon_steps
+
+    @torch.no_grad()
+    def conditional_remaining(
+        self, parameters: dict[str, torch.Tensor], target: torch.Tensor, observed_steps: int,
+        rows: torch.Tensor | None = None, observed: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Kalman-type update after observing y_1..y_m: mean and variance of y_K - y_m.
+
+        For each jump component the update is exact Gaussian conditioning; the
+        components are re-weighted by the likelihood of the observed partial path,
+        so a jump early in the holding period is not mistaken for drift.
+        """
+        steps, m = self.horizon_steps, observed_steps
+        if not 1 <= m < steps:
+            raise ValueError("observed_steps must lie in [1, K-1].")
+        y = self.standardise(target).reshape(-1, steps)
+        if rows is not None:
+            y = y[rows]
+        if observed is not None:
+            # Condition on the causal (close-based) partial path instead of y_1..y_m.
+            y_observed = self.standardise(observed).reshape(-1, observed.shape[-1])
+            if rows is not None:
+                y_observed = y_observed[rows]
+            y = torch.cat([y_observed[:, :m], y[:, m:]], dim=1)
+        mean, components, log_prior = self.component_laws(parameters, rows)
+        last, mid = steps - 1, m - 1
+        observed_cov = components[..., :m, :m]
+        cross = components[..., last, :m] - components[..., mid, :m]
+        remaining_var = (
+            components[..., last, last] + components[..., mid, mid] - 2.0 * components[..., last, mid]
+        )
+        residual = (y[:, :m] - mean[:, :m]).unsqueeze(1).expand(-1, components.shape[1], -1)
+        jitter = 1e-6 * torch.eye(m, device=y.device, dtype=y.dtype)
+        cholesky = torch.linalg.cholesky(observed_cov + jitter)
+        solved_residual = torch.cholesky_solve(residual.unsqueeze(-1), cholesky).squeeze(-1)
+        solved_cross = torch.cholesky_solve(cross.unsqueeze(-1), cholesky).squeeze(-1)
+        component_mean = (mean[:, last] - mean[:, mid]).unsqueeze(1) + (cross * solved_residual).sum(dim=-1)
+        component_var = (remaining_var - (cross * solved_cross).sum(dim=-1)).clamp_min(1e-8)
+        posterior = torch.softmax(log_prior + _mvn_logpdf(residual, observed_cov), dim=1)
+        conditional_mean = (posterior * component_mean).sum(dim=1)
+        conditional_var = (posterior * (component_var + component_mean.square())).sum(dim=1) - conditional_mean.square()
+        return conditional_mean, conditional_var.clamp_min(1e-8)
 
 
 def fit_sde_target_scale(dataset: "CrossSectionalMinuteDataset") -> float:
@@ -2131,6 +2489,35 @@ def _validation_nll(
             labels = float(target_mask.sum().item())
             total += float(nll_function(parameters, target, target_mask).item()) * labels
             count += labels
+    return total / count if count > 0 else float("nan")
+
+
+def _validation_horizon_nll(
+    model: nn.Module,
+    loader: DataLoader,
+    nll_function: MultiHorizonNLL,
+    horizon_steps: int,
+    holding_minutes: int,
+    device: torch.device,
+    amp_enabled: bool,
+    non_blocking: bool,
+) -> float:
+    """Window-weighted mean multi-horizon NLL (per horizon) on a frozen split."""
+    model.eval()
+    dataset = loader.dataset
+    total, count = 0.0, 0.0
+    with torch.no_grad():
+        for path, _target, _target_mask, indices in loader:
+            path = _to_device(path, device, non_blocking)
+            horizon_target, horizon_mask = dataset.horizon_targets(indices.numpy(), horizon_steps, holding_minutes)
+            horizon_target = torch.from_numpy(horizon_target).to(device)
+            horizon_mask = torch.from_numpy(horizon_mask).to(device)
+            with _autocast_context(device, amp_enabled):
+                parameters = model.forward_horizon(path)
+            labels = float(horizon_mask.sum().item())
+            if labels > 0:
+                total += float(nll_function(parameters, horizon_target, horizon_mask).item()) * labels
+                count += labels
     return total / count if count > 0 else float("nan")
 
 
@@ -2877,6 +3264,8 @@ class SeedTrainingResult:
     best_validation_ic: float
     validation_predictions: pd.DataFrame
     test_predictions: pd.DataFrame | None
+    validation_filter: pd.DataFrame | None = None
+    test_filter: pd.DataFrame | None = None
 
 
 def _format_duration(seconds: float) -> str:
@@ -2920,6 +3309,7 @@ def _train_one_seed(
         attention_heads=config.attention_heads,
         attention_dropout=config.attention_dropout,
         context_dropout=config.context_dropout,
+        horizon_steps=config.sde_horizon_steps,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     sector_ids = None
@@ -2933,6 +3323,13 @@ def _train_one_seed(
             raise ValueError("The SDE model needs a train-only target scale.")
         nll_function = PredictiveNLL(
             sde_target_scale, config.sde_target_clip, config.sde_jump_mode, config.sde_jump_max_count
+        ).to(device)
+    horizon_steps = config.sde_horizon_steps
+    horizon_nll: MultiHorizonNLL | None = None
+    if horizon_steps > 1:
+        horizon_nll = MultiHorizonNLL(
+            sde_target_scale, config.sde_target_clip, config.sde_jump_mode, horizon_steps,
+            config.sde_horizon_jump_max_count,
         ).to(device)
     best_validation_nll = float("nan")
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
@@ -2985,13 +3382,31 @@ def _train_one_seed(
         losses: list[float] = []
         nll_losses: list[float] = []
         epoch_start = time.perf_counter()
-        for batch_index, (path, target, target_mask, _) in enumerate(train_loader, start=1):
+        for batch_index, (path, target, target_mask, sample_indices) in enumerate(train_loader, start=1):
             path = _to_device(path, device, use_pinned_memory)
             target = _to_device(target, device, use_pinned_memory)
             target_mask = _to_device(target_mask, device, use_pinned_memory)
             optimizer.zero_grad(set_to_none=True)
             with _autocast_context(device, use_amp):
-                if nll_function is not None:
+                if horizon_nll is not None:
+                    horizon_target, horizon_mask = train_set.horizon_targets(
+                        sample_indices.numpy(), horizon_steps, config.holding_minutes
+                    )
+                    horizon_target = torch.from_numpy(horizon_target).to(device)
+                    horizon_mask = torch.from_numpy(horizon_mask).to(device)
+                    parameters = model.forward_horizon(path)
+                    prediction = parameters["mean"]
+                    rank_loss = loss_function(prediction, target, target_mask)
+                    if config.sde_horizon_rank_all:
+                        partial_losses = [
+                            loss_function(parameters["horizon_mean"][..., k], horizon_target[..., k], horizon_mask)
+                            for k in range(horizon_steps - 1)
+                        ]
+                        rank_loss = (rank_loss + torch.stack(partial_losses).sum()) / horizon_steps
+                    nll_loss = horizon_nll(parameters, horizon_target, horizon_mask)
+                    loss = rank_loss + config.sde_nll_weight * nll_loss
+                    nll_losses.append(float(nll_loss.item()))
+                elif nll_function is not None:
                     parameters = model.forward_predictive(path)
                     prediction = parameters["mean"]
                     rank_loss = loss_function(prediction, target, target_mask)
@@ -3033,13 +3448,21 @@ def _train_one_seed(
         validation_nll = float("nan")
         sde_message = ""
         if nll_function is not None:
-            validation_nll = _validation_nll(
-                model, validation_loader, nll_function, device, use_amp, use_pinned_memory
-            )
+            if horizon_nll is not None:
+                validation_nll = _validation_horizon_nll(
+                    model, validation_loader, horizon_nll, horizon_steps, config.holding_minutes,
+                    device, use_amp, use_pinned_memory,
+                )
+            else:
+                validation_nll = _validation_nll(
+                    model, validation_loader, nll_function, device, use_amp, use_pinned_memory
+                )
             sde_message = (
                 f" | train NLL {np.mean(nll_losses):.5f} | validation NLL {validation_nll:.5f}"
                 f" | obs std {float(torch.exp(model.log_observation_std).item()):.4f}"
             )
+            if horizon_nll is not None:
+                sde_message += f" | meas std {float(torch.exp(model.log_measurement_std).item()):.4f}"
             if model.jump_mode == "student_t":
                 sde_message += f" | dof {2.0 + float(torch.exp(model.log_dof_minus_two).item()):.2f}"
         train_ic_message = ""
@@ -3107,6 +3530,17 @@ def _train_one_seed(
     validation_predictions.to_parquet(output_dir / f"seed_{seed}_validation_predictions.parquet", index=False)
     if test_predictions is not None:
         test_predictions.to_parquet(output_dir / f"seed_{seed}_oos_predictions.parquet", index=False)
+    validation_filter = test_filter = None
+    if horizon_nll is not None:
+        validation_filter = horizon_filter_frame(
+            model, validation_set, horizon_nll, config.holding_minutes, device, use_amp, use_pinned_memory
+        )
+        validation_filter.to_parquet(output_dir / f"seed_{seed}_validation_horizon_filter.parquet", index=False)
+        if test_set is not None:
+            test_filter = horizon_filter_frame(
+                model, test_set, horizon_nll, config.holding_minutes, device, use_amp, use_pinned_memory
+            )
+            test_filter.to_parquet(output_dir / f"seed_{seed}_oos_horizon_filter.parquet", index=False)
     (output_dir / f"seed_{seed}_training_summary.json").write_text(
         json.dumps(
             {
@@ -3132,7 +3566,206 @@ def _train_one_seed(
         best_validation_ic=best_validation_ic,
         validation_predictions=validation_predictions,
         test_predictions=test_predictions,
+        validation_filter=validation_filter,
+        test_filter=test_filter,
     )
+
+
+def horizon_filter_frame(
+    model: nn.Module,
+    dataset: CrossSectionalMinuteDataset,
+    nll_function: MultiHorizonNLL,
+    holding_minutes: int,
+    device: torch.device,
+    amp_enabled: bool,
+    non_blocking: bool,
+) -> pd.DataFrame:
+    """Per (signal time, name): horizon targets, horizon means, and filter updates.
+
+    Columns (standardised units): ``y_h{k}`` realised cumulative sector-excess
+    return (open to open), ``obs_h{k}`` the causal partial return to the close of
+    minute t+tau_k, ``mu_h{k}`` predicted mean at horizon k, and for every number
+    m of observed sub-intervals ``filter_mean_m{m}`` / ``filter_var_m{m}``, the
+    conditional law of the remaining return y_K - y_m given the causal path
+    obs_1..obs_m (the update is made at the close of minute t+tau_m and the
+    remaining return starts at the next open).
+    """
+    steps = nll_function.horizon_steps
+    loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=0, pin_memory=non_blocking)
+    symbols = np.array(dataset.symbols)
+    sectors = np.array([SECTOR_BY_SYMBOL[symbol] for symbol in dataset.symbols])
+    parts: list[pd.DataFrame] = []
+    model.eval()
+    with torch.no_grad():
+        for path, _target, _target_mask, indices in loader:
+            path = _to_device(path, device, non_blocking)
+            index_np = indices.numpy()
+            horizon_target, horizon_mask = dataset.horizon_targets(index_np, steps, holding_minutes)
+            observed_path, observed_mask = dataset.observed_partial_returns(index_np, steps, holding_minutes)
+            horizon_mask = horizon_mask & observed_mask
+            rows = torch.from_numpy(horizon_mask.reshape(-1)).to(device).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            with _autocast_context(device, amp_enabled):
+                parameters = model.forward_horizon(path)
+            target = torch.from_numpy(horizon_target).to(device)
+            y = nll_function.standardise(target).reshape(-1, steps)[rows]
+            mean = parameters["horizon_mean"].float().reshape(-1, steps)[rows]
+            columns: dict[str, np.ndarray] = {}
+            y_np, mean_np = y.cpu().numpy(), mean.cpu().numpy()
+            for k in range(steps):
+                columns[f"y_h{k + 1}"] = y_np[:, k]
+                columns[f"mu_h{k + 1}"] = mean_np[:, k]
+            observed = torch.from_numpy(observed_path).to(device)
+            observed_np = nll_function.standardise(observed).reshape(-1, steps - 1)[rows].cpu().numpy()
+            for k in range(steps - 1):
+                columns[f"obs_h{k + 1}"] = observed_np[:, k]
+            for m in range(1, steps):
+                conditional_mean, conditional_var = nll_function.conditional_remaining(
+                    parameters, target, m, rows, observed=observed
+                )
+                columns[f"filter_mean_m{m}"] = conditional_mean.cpu().numpy()
+                columns[f"filter_var_m{m}"] = conditional_var.cpu().numpy()
+            flat = rows.cpu().numpy()
+            sample_position, symbol_position = np.divmod(flat, len(symbols))
+            ends = dataset.sample_end_indices[index_np[sample_position]]
+            parts.append(
+                pd.DataFrame(
+                    {
+                        "session": dataset.sessions[ends],
+                        "timestamp": dataset.timestamps[ends],
+                        "symbol": symbols[symbol_position],
+                        "sector": sectors[symbol_position],
+                        **columns,
+                    }
+                )
+            )
+    if not parts:
+        raise ValueError("No window has every horizon label; cannot evaluate the filter.")
+    return pd.concat(parts, ignore_index=True).sort_values(["session", "timestamp", "symbol"]).reset_index(drop=True)
+
+
+def average_filter_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Seed ensemble of the filter frame: average the model columns, keep the realised ones."""
+    keys = ["session", "timestamp", "symbol", "sector"]
+    realised = [column for column in frames[0].columns if column.startswith(("y_h", "obs_h"))]
+    modelled = [column for column in frames[0].columns if column not in keys and column not in realised]
+    stacked = pd.concat([frame[keys + modelled] for frame in frames], ignore_index=True)
+    averaged = stacked.groupby(keys, sort=True)[modelled].mean().reset_index()
+    return averaged.merge(frames[0][keys + realised], on=keys, how="inner")
+
+
+def evaluate_horizon_filter(
+    frame: pd.DataFrame, holding_minutes: int, bootstrap_iterations: int, seed: int
+) -> dict[str, object]:
+    """Does updating the forecast with the realised partial path add information?
+
+    For every m (minutes observed = m * holding / K) the remaining return
+    y_K - y_m is ranked against:
+      * ``unconditional``: mu_K - mu_m, the original forecast, not updated;
+      * ``filtered``: the Kalman/Merton conditional mean given y_1..y_m;
+      * ``partial_return``: y_m itself (momentum if positive IC, reversal if negative);
+      * ``fresh``: mu_{K-m} of the new window that ends at the observation time,
+        i.e. what the model would forecast if it simply re-ran there;
+      * ``filtered_plus_fresh``: equal-weight sum of the two sector-z-scored signals.
+    All ICs are daily sector-neutral Rank ICs with day-block bootstrap intervals;
+    paired differences test filtered vs unconditional and filtered vs fresh.
+    """
+    steps = sum(1 for column in frame.columns if column.startswith("y_h"))
+    step_minutes = holding_minutes // steps
+    keys = ["session", "timestamp", "symbol"]
+
+    def daily_ic(signal: pd.Series, target: pd.Series, base: pd.DataFrame) -> pd.Series:
+        work = base[["session", "timestamp", "sector"]].assign(prediction=signal.to_numpy(), remaining=target.to_numpy())
+        work = work.dropna(subset=["prediction", "remaining"])
+        return _daily_rank_ic_from_prediction_frame(work, target_column="remaining")
+
+    def zscore(signal: pd.Series, base: pd.DataFrame) -> pd.Series:
+        groups = [base["session"], base["timestamp"], base["sector"]]
+        centred = signal - signal.groupby(groups).transform("mean")
+        return centred / centred.groupby(groups).transform("std").replace(0.0, np.nan)
+
+    term_structure = {}
+    for k in range(1, steps + 1):
+        series = daily_ic(frame[f"mu_h{k}"], frame[f"y_h{k}"], frame)
+        term_structure[f"{k * step_minutes}m"] = block_bootstrap_mean_ic(series, bootstrap_iterations, seed)
+    results: dict[str, object] = {
+        "horizon_steps": steps,
+        "step_minutes": step_minutes,
+        "windows": int(len(frame)),
+        "forecast_ic_by_horizon": term_structure,
+        "mean_abs_predicted_cumulative_return_by_horizon": {
+            f"{k * step_minutes}m": float(frame[f"mu_h{k}"].abs().mean()) for k in range(1, steps + 1)
+        },
+        "update_after_observing": {},
+    }
+    for m in range(1, steps):
+        remaining = frame[f"y_h{steps}"] - frame[f"y_h{m}"]
+        shifted = frame[keys + [f"mu_h{steps - m}"]].copy()
+        shifted["timestamp"] = shifted["timestamp"] - pd.Timedelta(minutes=m * step_minutes)
+        fresh = frame[keys].merge(shifted, on=keys, how="left")[f"mu_h{steps - m}"]
+        signals = {
+            "unconditional": frame[f"mu_h{steps}"] - frame[f"mu_h{m}"],
+            "filtered": frame[f"filter_mean_m{m}"],
+            # Causal partial return (to the close of the observation minute) when
+            # available; the open-to-open y_m shares its end price with the
+            # remaining return and would show a spurious bid-ask-bounce reversal.
+            "partial_return": frame[f"obs_h{m}"] if f"obs_h{m}" in frame.columns else frame[f"y_h{m}"],
+            "fresh": fresh,
+        }
+        # Compare every signal on the same rows: those where the fresh forecast exists
+        # (near the close the later window may lack a full set of horizon labels).
+        common = fresh.notna()
+        signals = {name: signal.where(common) for name, signal in signals.items()}
+        signals["filtered_plus_fresh"] = zscore(signals["filtered"], frame) + zscore(signals["fresh"], frame)
+        daily = {name: daily_ic(signal, remaining, frame) for name, signal in signals.items()}
+        summary = {name: block_bootstrap_mean_ic(series, bootstrap_iterations, seed) for name, series in daily.items()}
+        summary["fresh_coverage"] = float(fresh.notna().mean())
+        for left, right in (("filtered", "unconditional"), ("filtered", "fresh"), ("filtered_plus_fresh", "fresh")):
+            difference = (daily[left] - daily[right]).dropna()
+            summary[f"paired_{left}_minus_{right}"] = block_bootstrap_mean_ic(difference, bootstrap_iterations, seed)
+        variance = frame[f"filter_var_m{m}"]
+        standardised = (remaining - frame[f"filter_mean_m{m}"]) / np.sqrt(variance)
+        summary["filtered_z_score_std"] = float(standardised.std())
+        summary["filtered_90pct_coverage"] = float((standardised.abs() <= 1.6448536269514722).mean())
+        results["update_after_observing"][f"{m * step_minutes}m"] = summary
+    return results
+
+
+def write_horizon_filter_diagnostics(
+    config: RunConfig, output_dir: Path, seed_results: list["SeedTrainingResult"], split: str
+) -> dict[str, object]:
+    attribute = "validation_filter" if split == "validation" else "test_filter"
+    frames = [getattr(result, attribute) for result in seed_results]
+    if any(frame is None for frame in frames):
+        return {}
+    ensemble = average_filter_frames(frames)
+    ensemble.to_parquet(output_dir / f"ensemble_{split}_horizon_filter.parquet", index=False)
+    report = {
+        "ensemble": evaluate_horizon_filter(ensemble, config.holding_minutes, config.bootstrap_iterations, config.seed),
+        "seeds": {
+            str(result.seed): evaluate_horizon_filter(
+                frame, config.holding_minutes, config.bootstrap_iterations, config.seed
+            )
+            for result, frame in zip(seed_results, frames)
+        },
+    }
+    (output_dir / f"horizon_filter_{split}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    ensemble_report = report["ensemble"]
+    print(f"\nMulti-horizon forecast and filter update ({split}, ensemble):")
+    print("  forecast IC by horizon: " + ", ".join(
+        f"{horizon}={values['mean_daily_rank_ic']:.4f}"
+        for horizon, values in ensemble_report["forecast_ic_by_horizon"].items()
+    ))
+    for observed, summary in ensemble_report["update_after_observing"].items():
+        print(
+            f"  after {observed}: remaining-return IC unconditional={summary['unconditional']['mean_daily_rank_ic']:.4f} "
+            f"filtered={summary['filtered']['mean_daily_rank_ic']:.4f} "
+            f"fresh={summary['fresh']['mean_daily_rank_ic']:.4f} "
+            f"partial={summary['partial_return']['mean_daily_rank_ic']:.4f} "
+            f"filtered+fresh={summary['filtered_plus_fresh']['mean_daily_rank_ic']:.4f}"
+        )
+    return report
 
 
 def _sector_standardised_scores(frame: pd.DataFrame) -> pd.Series:
@@ -3343,6 +3976,11 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
             raise ValueError("sde_nll_weight must be non-negative.")
         if config.sde_jump_mode not in JUMP_MODES:
             raise ValueError(f"sde_jump_mode must be one of {JUMP_MODES}.")
+        if config.sde_horizon_steps > 1:
+            if config.holding_minutes % config.sde_horizon_steps != 0:
+                raise ValueError("holding_minutes must be a multiple of sde_horizon_steps.")
+            if config.sde_jump_mode == "student_t":
+                raise ValueError("The multi-horizon likelihood supports sde_jump_mode 'none' or 'merton'.")
         sde_target_scale = fit_sde_target_scale(train_set)
         sde_baseline_variance = per_symbol_baseline_variance(train_set, sde_target_scale, config.sde_target_clip)
         sde_spec = {
@@ -3369,6 +4007,14 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
             "jump_max_count": config.sde_jump_max_count,
             "jump_initial_intensity": config.sde_jump_initial_intensity,
             "jump_initial_std": config.sde_jump_initial_std,
+            "horizon_steps": config.sde_horizon_steps,
+            "horizon_specification": (
+                "endpoint only" if config.sde_horizon_steps == 1 else
+                "joint law of y(tau_k) = w'(Z_tau - Z_0) + q tau + sigma_B B_tau + eps (+ Merton jumps per "
+                "sub-interval), tau_k = k / K; exact recursions for mean and cross-covariance; jump mixture "
+                f"truncated at {config.sde_horizon_jump_max_count} jumps per holding period"
+            ),
+            "horizon_rank_all": config.sde_horizon_rank_all,
         }
         (output_dir / "sde_model_spec.json").write_text(json.dumps(sde_spec, indent=2), encoding="utf-8")
         print(
@@ -3447,6 +4093,10 @@ def run_pipeline(config: RunConfig) -> dict[str, dict[str, object]]:
         f"95% CI [{ensemble_validation_bootstrap['ci_95_lower']:.5f}, "
         f"{ensemble_validation_bootstrap['ci_95_upper']:.5f}]"
     )
+    if config.sde_horizon_steps > 1:
+        write_horizon_filter_diagnostics(config, output_dir, seed_results, "validation")
+        if config.evaluate_test:
+            write_horizon_filter_diagnostics(config, output_dir, seed_results, "oos")
     if not config.evaluate_test:
         if sde_target_scale is not None:
             write_sde_diagnostics(
