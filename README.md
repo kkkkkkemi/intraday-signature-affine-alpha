@@ -7,9 +7,13 @@ an exact Gaussian or jump-mixture forecast of each stock's sector-excess return,
 used for ranking and for uncertainty estimates. No quotes, trades or order-book
 data are used, so costs are assumptions and no result is an executable-PnL claim.
 
-**Status:** the code is complete. Results for this version (S&P 100 universe,
-v2 features, embedding/attention context, Merton jumps) have not been produced
-yet and will be added once the final frozen run is done.
+**Status:** finished. The configuration in `project_settings.py` was frozen on
+validation and the sealed test split was scored once. **Bottom line:** the
+30-minute cross-sectional signal is small (validation Rank IC 0.87%) and did not
+hold up on the test split (0.24%, not significant); break-even costs are far
+below realistic costs, so this is not a tradable strategy. The model's
+predictive distribution, however, stays calibrated out of sample. See
+[Results](#results).
 
 ## Workflow
 
@@ -21,6 +25,7 @@ yet and will be added once the final frozen run is done.
 | 4. Sanity tests | `test_linear_sde.py` | Van Loan vs quadrature/Monte Carlo, likelihoods vs scipy, gradients |
 | 5. Train | `train_model.py` | One run; validation-only while `EVALUATE_TEST = False` |
 | 6. Baseline | `train_xgboost.py` | Grouped XGBoost ranker on the same inputs, splits and labels |
+| 7. Filter and execution | `filter_execution_analysis.py` | Holding-period filter vs re-forecasting: information, turnover and cost on the 5-minute grid |
 
 Core library: `minute_alpha.py`. Universes and sectors: `universe.py`. Data
 client: `massive_download.py`. Install `requirements.txt` (`xgboost` is only
@@ -63,7 +68,8 @@ needed for the baseline).
   Lévy areas, PCA-compressed on training windows only. For large universes the
   PCA is fitted on a deterministic subsample of windows.
 - **Target:** the log return from the open at t+1 to the open at t+31, minus its
-  sector mean.
+  sector mean.  With `SDE_HORIZON_STEPS = K` the cumulative sector-excess
+  returns at every 30/K minutes of the holding period are modelled jointly.
 - **Latent SDE.** Given the context c,
 
   dZ = (A(c) Z + b(c)) dt + G(c) dW,   A = skew − diag(softplus) (stable),   y = wᵀZ₁ + q + ε.
@@ -72,6 +78,20 @@ needed for the baseline).
   - The covariance ∫₀¹ e^{As} G Gᵀ e^{Aᵀs} ds is exact via Van Loan's block
     exponential, so no Monte Carlo is needed.
   - `SDE_DIFFUSION_RANK = 0` gives the deterministic ablation.
+  - **Ranking is identical to the ODE.** In a linear SDE the diffusion and the
+    zero-mean jumps do not move the mean, so the SDE only adds a predictive
+    distribution on top of the ODE score.
+- **Multi-horizon law and holding-period filter.** With the observation
+  y(τ) = wᵀ(Z_τ − Z₀) + qτ + σ_B B_τ + ε on τ_k = k/K, the means and the full
+  cross-covariance Cov(y_j, y_k) = wᵀP_j(e^{Aᵀh})^{k−j}w + σ_B² min(τ_j, τ_k)
+  follow exact recursions (Van Loan step covariance). Merton jumps arrive
+  independently in each sub-interval, so the joint law is a finite Gaussian
+  mixture over jump-count vectors. After m sub-intervals of the holding period
+  the forecast of the remaining return is updated by exact Gaussian conditioning
+  within each mixture component, with the components re-weighted by the
+  likelihood of the observed path (a Kalman update that does not mistake an
+  early jump for drift). The update uses the causal partial return to the close
+  of the observation minute; see the look-ahead note in the results.
 - **Identity and interaction:**
   - a per-stock embedding (`STOCK_EMBEDDING_DIM`);
   - transformer layers across the stocks of each cross-section
@@ -116,7 +136,7 @@ needed for the baseline).
   - for Merton runs, jump intensity by time and symbol, and posterior jump
     probabilities.
 - **Benchmark:** the XGBoost ranker on the same inputs, with a paired daily-IC
-  comparison on validation.
+  comparison.
 
 ## Execution (research backtest)
 
@@ -129,8 +149,87 @@ needed for the baseline).
 
 ## Results
 
-Pending. They will be reported from validation for model selection and from the
-sealed test split exactly once, with day-block bootstrap confidence intervals.
+Universe: point-in-time S&P 100 (100 names). Sessions: train 2024-12-03 to
+2026-04-21 (345 days), validation 2026-04-22 to 2026-08-06 (74), test
+2026-08-07 to 2026-11-20 (75). Frozen configuration, chosen on validation only:
+no stock embedding or attention, v2 feature groups switched off (they did not
+raise validation IC), lr 1e-4, weight decay 1e-3, context dropout 0.1, rank-4
+latent SDE with Merton jumps and a 6-step multi-horizon likelihood, three seeds.
+Every interval below is a 95% day-block bootstrap interval.
+
+**Ranking (30-minute sector-neutral daily Rank IC)**
+
+| Model | Validation | Test |
+|---|---|---|
+| Latent SDE ensemble | 0.87% [0.22%, 1.56%] | 0.24% [−0.40%, 0.87%] |
+| XGBoost ranker, same inputs | 0.50% [−0.08%, 1.08%] | 0.57% [0.08%, 1.06%] |
+| XGBoost − SDE (paired, test) | | +0.33% [−0.24%, 0.90%] |
+
+- Validation IC was the same, within seed noise, for every architecture tried
+  (with and without stock embedding, cross-stock attention and the v2 features).
+  The best epoch was always the first or second; after that, training-subset IC
+  kept rising while validation IC did not.
+- On the test split the SDE's IC is not significantly different from zero, and
+  the two models are not significantly different from each other.
+- The multi-horizon likelihood left ranking unchanged: per-seed validation IC
+  matched the endpoint-only model to within 0.0001.
+
+**Predictive distribution (test split)**
+
+- NLL 1.621 against 1.680 for a per-symbol homoskedastic Gaussian baseline:
+  an improvement of 0.059 [0.044, 0.080] nats per label.
+- Central-interval coverage at 50 / 80 / 90 / 95 / 99 / 99.9%: 54.3 / 81.6 /
+  90.1 / 94.4 / 98.3 / 99.6%. The PIT KS statistic is 0.033.
+
+**Term structure and holding-period filter (causal)**
+
+- Validation Rank IC of the cumulative forecast is highest at 5 minutes and
+  falls with the horizon (1.05% at 5 min, 0.79% at 30 min). Most of the
+  predictability sits in the first 5 to 10 minutes.
+- After observing 5 to 25 minutes of the holding period, the remaining return is
+  ranked as follows:
+
+  | | Validation | Test |
+  |---|---|---|
+  | Original forecast (not updated) | ≈ 0.2 to 0.35% | ≈ −0.35 to −0.03% |
+  | Filter update | 0.40 to 0.71% | 0.80 to 1.25% |
+  | Re-run model at the observation time | 0.68 to 1.04% | 0.22 to 0.44% |
+
+  On the test split the update beats both alternatives at every observation
+  time; for example, after 15 minutes the filter exceeds the re-run model by
+  +0.87% [0.19%, 1.57%]. On validation it does not.
+- The update is close to a short-term reversal of the observed path: the causal
+  partial return alone has an IC of −1.0 to −1.4% on test.
+- The filter's conditional variance is calibrated: z-score standard deviation
+  1.01 to 1.03, and 90% coverage 90.4 to 91.2% on test.
+- **Look-ahead note.** A first version conditioned on the partial return to the
+  open of the next minute. That price is also the execution price and the
+  first price of the remaining return, so bid-ask bounce leaked into it. It
+  roughly doubled the apparent reversal (validation partial-return IC −1.1%
+  against −0.6% when causal) and made the filter look significant on
+  validation. All reported numbers use the causal version.
+
+**Economics**
+
+- **30-minute strategy** (sector-neutral, flat at the close). Annualised test
+  Sharpe at zero cost is −2.0 for the SDE and +1.2 for XGBoost; both are
+  negative at 0.6 bp one-way.
+- **5-minute decisions** (filter, re-run model, or reversal, with partial
+  adjustment). On validation the best break-even one-way cost is 0.27 bp, below
+  the ~0.2 bp half-spread of the most liquid names plus fees and impact. On
+  test, gross PnL with linear weights is about zero or negative, even though the
+  filter's rank IC is positive. The rank effect does not carry over to
+  magnitude-weighted positions.
+- **Why.** With break-even cost ≈ 1.25 · IC · σ / √(2(1 − ρ)), σ ≈ 18 bp per 30
+  minutes and almost no signal persistence (ρ ≈ 0), even a doubled IC would
+  break even only around 0.3 bp. Minute-bar OHLCV on S&P 100 names does not
+  carry enough cross-sectional information for an intraday strategy after
+  costs.
+
+**What the SDE adds.** It does not improve ranking, and cannot, since its mean
+is the ODE's. What it adds is a calibrated predictive law with jumps, an exact
+term structure across the holding period, and a calibrated filter for the
+remaining return.
 
 ## Data policy
 
